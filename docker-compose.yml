@@ -1,0 +1,295 @@
+name: ${COMPOSE_PROJECT_NAME:-aisales}
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  postgres:
+    <<: *common
+    image: ${POSTGRES_IMAGE:-postgres:16.6-alpine}
+    container_name: aisales-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      TZ: ${TZ:-UTC}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - ./postgres:/sql:ro
+    ports:
+      - "${POSTGRES_BIND_ADDR:-127.0.0.1}:${POSTGRES_BIND_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+  n8n:
+    <<: *common
+    image: ${N8N_IMAGE:-n8nio/n8n:1.123.81}
+    container_name: aisales-n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: n8n
+
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      N8N_EDITOR_BASE_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY is required}
+      # There is no N8N_BASIC_AUTH_* here on purpose: n8n removed basic auth in
+      # 1.0 and ignores those variables. The editor is protected by the owner
+      # account n8n asks for on first start, and by never being published
+      # beyond loopback (see CADDY_BIND_ADDR below).
+      N8N_PROXY_HOPS: 1
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      TZ: ${TZ:-UTC}
+      # How the crawlers in WF-01..03 and WF-12 identify themselves to the sites
+      # they read. Set it in .env to something with your own contact URL.
+      BOT_USER_AGENT: ${BOT_USER_AGENT:-AiSalesMachineBot/1.0 (+https://github.com/foldnine/ai-sales-machine)}
+
+      # Regular execution mode, not queue mode: one n8n process on one machine.
+      # Queue mode needs Redis plus separate worker containers and buys nothing
+      # at this volume, so there is no Redis in this stack. Every piece of state
+      # that must survive a restart (throttles, dedup, notifications) is already
+      # in Postgres.
+
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 336
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+
+      # Everything a workflow reads through $env has to be listed here. A
+      # variable that is only in .env reaches docker compose and stops there;
+      # inside n8n it is simply undefined, and `$env.X || 5` quietly uses 5.
+      # That is how the three model variables below went unnoticed: the
+      # fallbacks in the workflows matched .env, so the pipeline ran on the
+      # right models for the wrong reason and changing .env would have done
+      # nothing. The defaults here repeat the ones in the workflows on purpose,
+      # so that a missing .env still starts and the two cannot drift apart
+      # silently.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      OLLAMA_RESEARCH_MODEL: ${OLLAMA_RESEARCH_MODEL:-qwen9-64k:latest}
+      OLLAMA_SCORING_MODEL: ${OLLAMA_SCORING_MODEL:-qwen9-64k:latest}
+      OLLAMA_OUTREACH_MODEL: ${OLLAMA_OUTREACH_MODEL:-qwen9-64k:latest}
+      OLLAMA_ENRICHMENT_MODEL: ${OLLAMA_ENRICHMENT_MODEL:-llama3.1:8b}
+
+      # WF-08 classification. The escalation model is local too: there is no
+      # LLM_API_KEY, and asking a slower, better local model when the fast one
+      # is unsure is the same idea the classifier prompt asks for, at no cost.
+      INBOX_RECONNECT_MINUTES: ${INBOX_RECONNECT_MINUTES:-5}
+      OLLAMA_CLASSIFIER_MODEL: ${OLLAMA_CLASSIFIER_MODEL:-llama3.1:8b}
+      OLLAMA_CLASSIFIER_ESCALATION_MODEL: ${OLLAMA_CLASSIFIER_ESCALATION_MODEL:-qwen3.6:27b}
+      CLASSIFIER_MODEL_TIMEOUT_MS: ${CLASSIFIER_MODEL_TIMEOUT_MS:-120000}
+      CLASSIFIER_ESCALATION_TIMEOUT_MS: ${CLASSIFIER_ESCALATION_TIMEOUT_MS:-300000}
+      OLLAMA_REPLY_MODEL: ${OLLAMA_REPLY_MODEL:-qwen3.6:27b}
+      REPLY_MODEL_TIMEOUT_MS: ${REPLY_MODEL_TIMEOUT_MS:-900000}
+
+      # Telegram. WF-10 still sends through the n8n credential and never sees
+      # the token.
+      #
+      # TELEGRAM_BOT_TOKEN used to be deliberately absent, so that the token
+      # could not reach an execution URL. WF-11 makes that impossible to keep:
+      # it reads commands by polling getUpdates, the Telegram API carries the
+      # token in the URL path and offers no header to put it in instead, and
+      # Telegram cannot call this machine to make a webhook an option.
+      #
+      # So the rule moved rather than broke. The token is here, and WF-11 saves
+      # no execution data at all - see its settings block - so there is nothing
+      # for the URL to be recorded in. The audit trail that n8n's execution
+      # history would have provided is the command_log table instead, which is
+      # better: it survives pruning and it can be queried. See docs/telegram.md.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_ENABLED: "${TELEGRAM_ENABLED:-false}"
+
+      # Notification outbox (WF-10), see docs/notifications.md.
+      NOTIFY_BATCH_SIZE: ${NOTIFY_BATCH_SIZE:-10}
+      NOTIFY_MAX_ATTEMPTS: ${NOTIFY_MAX_ATTEMPTS:-5}
+      NOTIFY_RETRY_BACKOFF_MINUTES: ${NOTIFY_RETRY_BACKOFF_MINUTES:-10}
+      NOTIFY_STALE_CLAIM_MINUTES: ${NOTIFY_STALE_CLAIM_MINUTES:-10}
+      ALERT_COOLOFF_MINUTES: ${ALERT_COOLOFF_MINUTES:-60}
+      HOT_ALERT_COOLOFF_DAYS: ${HOT_ALERT_COOLOFF_DAYS:-30}
+
+      # Agent health thresholds (WF-101).
+      HEALTH_ERROR_RATE_THRESHOLD: ${HEALTH_ERROR_RATE_THRESHOLD:-0.25}
+      HEALTH_ERROR_RATE_MIN_RUNS: ${HEALTH_ERROR_RATE_MIN_RUNS:-3}
+      HEALTH_STUCK_RUN_MINUTES: ${HEALTH_STUCK_RUN_MINUTES:-15}
+      HEALTH_ORPHAN_RESEARCH_MINUTES: ${HEALTH_ORPHAN_RESEARCH_MINUTES:-120}
+      HEALTH_STALLED_QUEUE_HOURS: ${HEALTH_STALLED_QUEUE_HOURS:-6}
+      HEALTH_ALERT_COOLOFF_MINUTES: ${HEALTH_ALERT_COOLOFF_MINUTES:-360}
+
+      # Discovery (WF-01). Two public directories, no API key between them.
+      # DISCOVERY_DAILY_LIMIT is the real throttle on this whole pipeline: the
+      # sources hold more companies than a local research model can read in a
+      # month, so the surplus is deliberately left undiscovered until tomorrow.
+      DISCOVERY_DAILY_LIMIT: ${DISCOVERY_DAILY_LIMIT:-120}
+      DISCOVERY_MIN_TEAM_SIZE: ${DISCOVERY_MIN_TEAM_SIZE:-10}
+      DISCOVERY_MAX_TEAM_SIZE: ${DISCOVERY_MAX_TEAM_SIZE:-120}
+      DISCOVERY_MAX_BATCH_AGE_YEARS: ${DISCOVERY_MAX_BATCH_AGE_YEARS:-8}
+      DISCOVERY_OSM_COUNTRIES: ${DISCOVERY_OSM_COUNTRIES:-}
+      DISCOVERY_OSM_MAX_LOCATIONS: ${DISCOVERY_OSM_MAX_LOCATIONS:-3}
+      DISCOVERY_OSM_REFRESH_DAYS: ${DISCOVERY_OSM_REFRESH_DAYS:-7}
+      DISCOVERY_OSM_REFRESH_PER_DAY: ${DISCOVERY_OSM_REFRESH_PER_DAY:-3}
+
+      # Research pass (WF-02).
+      RESEARCH_MODEL_TIMEOUT_MS: ${RESEARCH_MODEL_TIMEOUT_MS:-900000}
+      TRIAGE_MODEL_TIMEOUT_MS: ${TRIAGE_MODEL_TIMEOUT_MS:-180000}
+      SCORING_MODEL_TIMEOUT_MS: ${SCORING_MODEL_TIMEOUT_MS:-900000}
+      OUTREACH_MODEL_TIMEOUT_MS: ${OUTREACH_MODEL_TIMEOUT_MS:-900000}
+      ENRICHMENT_MODEL_TIMEOUT_MS: ${ENRICHMENT_MODEL_TIMEOUT_MS:-600000}
+      RESEARCH_MAX_TOKENS: ${RESEARCH_MAX_TOKENS:-20000}
+      RESEARCH_BATCH_SIZE: ${RESEARCH_BATCH_SIZE:-5}
+      RESEARCH_CANDIDATE_POOL: ${RESEARCH_CANDIDATE_POOL:-25}
+      RESEARCH_DOMAIN_COOLDOWN_MINUTES: ${RESEARCH_DOMAIN_COOLDOWN_MINUTES:-60}
+      RESEARCH_FETCH_BATCH_SIZE: ${RESEARCH_FETCH_BATCH_SIZE:-1}
+      RESEARCH_FETCH_BATCH_INTERVAL_MS: ${RESEARCH_FETCH_BATCH_INTERVAL_MS:-1000}
+
+      # External ATS job boards (WF-02). Most companies of this profile do not
+      # advertise infrastructure roles on their own domain; they publish them on
+      # a job board whose JSON is public. These control how hard that is probed
+      # and how much of the result reaches the model.
+      RESEARCH_ATS_MAX_CANDIDATES: ${RESEARCH_ATS_MAX_CANDIDATES:-8}
+      RESEARCH_ATS_BATCH_INTERVAL_MS: ${RESEARCH_ATS_BATCH_INTERVAL_MS:-400}
+      RESEARCH_ATS_MAX_CHARS: ${RESEARCH_ATS_MAX_CHARS:-14000}
+      RESEARCH_MATERIAL_MAX_CHARS: ${RESEARCH_MATERIAL_MAX_CHARS:-32000}
+
+      # Contact enrichment (WF-03).
+      ENRICH_BATCH_SIZE: ${ENRICH_BATCH_SIZE:-6}
+      ENRICH_CANDIDATE_POOL: ${ENRICH_CANDIDATE_POOL:-15}
+      ENRICH_RETRY_DAYS: ${ENRICH_RETRY_DAYS:-30}
+
+      # Finding contacts through the company's own public repositories (WF-03).
+      # The website route yields nothing: of eleven companies checked, none
+      # published a personal address, so the pattern inference had nothing to
+      # observe. Commit metadata does carry it. GITHUB_TOKEN is optional and
+      # raises the API limit from 60 requests an hour to 5000.
+      ENRICH_GITHUB_ENABLED: ${ENRICH_GITHUB_ENABLED:-false}
+      ENRICH_GITHUB_MAX_ORGS: ${ENRICH_GITHUB_MAX_ORGS:-3}
+      ENRICH_GITHUB_MAX_REPOS: ${ENRICH_GITHUB_MAX_REPOS:-3}
+      ENRICH_GITHUB_COMMITS_PER_REPO: ${ENRICH_GITHUB_COMMITS_PER_REPO:-40}
+      ENRICH_GITHUB_MAX_PEOPLE: ${ENRICH_GITHUB_MAX_PEOPLE:-12}
+      ENRICH_GITHUB_INTERVAL_MS: ${ENRICH_GITHUB_INTERVAL_MS:-400}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+
+      # Scoring and outreach.
+      RESCORE_AFTER_DAYS: ${RESCORE_AFTER_DAYS:-7}
+      RESCORE_BATCH_SIZE: ${RESCORE_BATCH_SIZE:-50}
+      OUTREACH_MIN_SCORE: ${OUTREACH_MIN_SCORE:-60}
+      OUTREACH_FOLLOWUP_MAX: ${OUTREACH_FOLLOWUP_MAX:-2}
+      OUTREACH_FOLLOWUP_DELAY_DAYS: ${OUTREACH_FOLLOWUP_DELAY_DAYS:-4}
+
+      # Dispatch (WF-06). Every one of these is a guard on sending, so the
+      # default each falls back to is the restrictive one: paused, and a window
+      # that is closed rather than open. A variable missing from this block is
+      # invisible to n8n no matter what .env says.
+      OUTREACH_PAUSED: ${OUTREACH_PAUSED:-true}
+      # Guarded autosend's master switch (0030_autosend.sql). Anything but "true"
+      # and WF-05 approves nothing by itself, whatever /autosend on says.
+      OUTREACH_AUTOSEND_ENABLED: ${OUTREACH_AUTOSEND_ENABLED:-false}
+      OUTREACH_LANGUAGES: ${OUTREACH_LANGUAGES:-}
+      OUTREACH_NIGHT_MODEL: ${OUTREACH_NIGHT_MODEL:-qwen3.6:27b}
+      OUTREACH_NIGHT_HOUR_START: ${OUTREACH_NIGHT_HOUR_START:-1}
+      OUTREACH_NIGHT_HOUR_END: ${OUTREACH_NIGHT_HOUR_END:-5}
+      OUTREACH_NIGHT_BATCH_SIZE: ${OUTREACH_NIGHT_BATCH_SIZE:-20}
+      OUTREACH_DAILY_LIMIT: ${OUTREACH_DAILY_LIMIT:-5}
+      OUTREACH_PER_DOMAIN_LIMIT: ${OUTREACH_PER_DOMAIN_LIMIT:-1}
+      OUTREACH_DISPATCH_BATCH_SIZE: ${OUTREACH_DISPATCH_BATCH_SIZE:-5}
+      OUTREACH_WORKING_HOUR_START: ${OUTREACH_WORKING_HOUR_START:-9}
+      OUTREACH_WORKING_HOUR_END: ${OUTREACH_WORKING_HOUR_END:-17}
+      OUTREACH_WORKING_DAYS: ${OUTREACH_WORKING_DAYS:-1,2,3,4,5}
+
+      # The envelope WF-06 sends with. The SMTP host and password are not here:
+      # they live in the n8n SMTP credential, encrypted with N8N_ENCRYPTION_KEY.
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-}
+      EMAIL_REPLY_TO: ${EMAIL_REPLY_TO:-}
+    # Ollama runs natively on the host, not in a container: Docker Desktop on
+    # macOS gives a container no Metal access, so an Ollama container is CPU-only
+    # on a machine with a perfectly good GPU. Mapping the name "ollama" to the
+    # host gateway keeps every URL, credential and default that says
+    # http://ollama:11434 working unchanged. See docs/ollama.md.
+    extra_hosts:
+      - "ollama:host-gateway"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+      - ./prompts:/prompts:ro
+      - ./agents:/agents:ro
+    ports:
+      - "${N8N_BIND_ADDR:-127.0.0.1}:${N8N_BIND_PORT:-5678}:5678"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:5678/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - backend
+      - edge
+
+  caddy:
+    <<: *common
+    image: ${CADDY_IMAGE:-caddy:2.8-alpine}
+    container_name: aisales-caddy
+    depends_on:
+      - n8n
+    environment:
+      CADDY_DOMAIN: ${CADDY_DOMAIN:-n8n.example.com}
+      CADDY_EMAIL: ${CADDY_EMAIL:-}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      # Nothing in this stack needs inbound traffic: Telegram is polled, mail is
+      # SMTP/IMAP outbound, and no workflow has a webhook trigger. Loopback by
+      # default. Remote access is `tailscale serve` in front of 127.0.0.1:5678
+      # (docs/setup.md). 0.0.0.0 publishes the n8n editor to the internet.
+      - "${CADDY_BIND_ADDR:-127.0.0.1}:${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_BIND_ADDR:-127.0.0.1}:${CADDY_HTTPS_PORT:-443}:443"
+    healthcheck:
+      test: ["CMD-SHELL", "caddy version >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - edge
+
+networks:
+  backend:
+    driver: bridge
+  edge:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  n8n_data:
+  caddy_data:
+  caddy_config:

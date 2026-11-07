@@ -1,0 +1,301 @@
+{
+  "id": "wf06OutreachDispatch",
+  "name": "AI Sales — WF-06 Outreach Dispatch",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "n6-trigger",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        300
+      ],
+      "notes": "The window guard is in the claim, not here: a schedule cannot know the configured timezone."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim approved messages for sending, and move each one to 'queued' in the\n-- same statement so a second run cannot take it.\n--\n-- Every guard docs/workflows.md lists is here, in the order it lists them.\n-- They are in the claim rather than in a later IF node on purpose: a guard\n-- that runs after the row has been picked up can only refuse to send it,\n-- which leaves the row claimed and needing a human. A guard in the WHERE\n-- clause never claims it at all.\n--\n-- OUTREACH_PAUSED is first because it is the stop button. When it is true\n-- this statement returns zero rows and nothing downstream executes at all,\n-- whatever the other guards would have said.\nWITH cfg AS (\n    SELECT $1::jsonb AS p\n),\nlocal AS (\n    -- Evaluated in the configured timezone, not the server's. A message that\n    -- arrives at 03:00 local time reads as automation no matter how well it\n    -- is written.\n    SELECT now() AT TIME ZONE (SELECT p ->> 'timezone' FROM cfg) AS ts\n),\ngate AS (\n    SELECT\n        NOT (SELECT (p ->> 'paused')::boolean FROM cfg) AS not_paused,\n        EXTRACT(isodow FROM (SELECT ts FROM local))::int IN (\n            SELECT jsonb_array_elements_text(p -> 'working_days')::int FROM cfg\n        ) AS in_working_days,\n        EXTRACT(hour FROM (SELECT ts FROM local))::int\n            >= (SELECT (p ->> 'hour_start')::int FROM cfg)\n        AND EXTRACT(hour FROM (SELECT ts FROM local))::int\n            <  (SELECT (p ->> 'hour_end')::int FROM cfg) AS in_working_hours\n),\nspent_today AS (\n    -- What already counts against today's allowance. 'queued' counts as well\n    -- as 'sent': a row in flight is going to become sent, and counting it only\n    -- once it has would overshoot the daily limit by a whole batch every run.\n    SELECT count(*)::int AS n\n    FROM outreach o\n    WHERE o.status IN ('sent', 'queued')\n      AND COALESCE(o.sent_at, o.updated_at)\n              AT TIME ZONE (SELECT p ->> 'timezone' FROM cfg)\n          >= date_trunc('day', (SELECT ts FROM local))\n),\nallowance AS (\n    SELECT GREATEST(\n        (SELECT (p ->> 'daily_limit')::int FROM cfg) - (SELECT n FROM spent_today),\n        0\n    ) AS n\n),\nlocked AS (\n    -- A pool rather than exactly what will be sent, because the per-domain\n    -- rule below has to choose between siblings and cannot do that if they\n    -- were never locked. Locks release at the end of this statement either\n    -- way, so over-locking costs nothing.\n    SELECT o.id, o.created_at, c.domain, l.score\n    FROM outreach o\n    JOIN leads     l  ON l.id  = o.lead_id\n    JOIN people    pe ON pe.id = l.person_id\n    JOIN companies c  ON c.id  = l.company_id\n    WHERE o.status = 'approved'\n      AND (SELECT not_paused AND in_working_days AND in_working_hours FROM gate)\n      AND (SELECT n FROM allowance) > 0\n      -- The recipient must still be reachable. The trigger on outreach refuses\n      -- a suppressed address anyway, but a transaction that aborts at send\n      -- time has already spent the claim; refusing here costs nothing.\n      AND pe.email IS NOT NULL\n      AND NOT is_suppressed(pe.email)\n      -- Per-domain ceiling for today, counting the same two statuses as above.\n      AND (\n          SELECT count(*)\n          FROM outreach o2\n          JOIN leads     l2 ON l2.id = o2.lead_id\n          JOIN companies c2 ON c2.id = l2.company_id\n          WHERE c2.domain = c.domain\n            AND o2.status IN ('sent', 'queued')\n            AND COALESCE(o2.sent_at, o2.updated_at)\n                    AT TIME ZONE (SELECT p ->> 'timezone' FROM cfg)\n                >= date_trunc('day', (SELECT ts FROM local))\n      ) < (SELECT (p ->> 'per_domain_limit')::int FROM cfg)\n    ORDER BY l.score DESC NULLS LAST, o.created_at\n    LIMIT (SELECT (p ->> 'batch_size')::int * 4 FROM cfg)\n    FOR UPDATE OF o SKIP LOCKED\n),\none_per_domain AS (\n    -- The subquery above cannot see a sibling claimed in this same run, so two\n    -- messages to the same company would both pass it. At most one row per\n    -- domain per run closes that, and is exactly right at the default limit of\n    -- one. Above that it under-sends and the next run catches up, which is the\n    -- side to err on.\n    SELECT DISTINCT ON (domain) id, domain, score, created_at\n    FROM locked\n    ORDER BY domain, score DESC NULLS LAST, created_at\n),\nchosen AS (\n    SELECT id FROM one_per_domain\n    ORDER BY score DESC NULLS LAST, created_at\n    LIMIT LEAST((SELECT (p ->> 'batch_size')::int FROM cfg), (SELECT n FROM allowance))\n),\nqueued AS (\n    UPDATE outreach\n    SET status = 'queued'\n    WHERE id IN (SELECT id FROM chosen)\n      AND status = 'approved'\n    RETURNING id\n)\nSELECT q.id            AS outreach_id,\n       o.lead_id,\n       o.subject,\n       o.body,\n       o.sequence_step,\n       pe.email        AS recipient_email,\n       pe.full_name    AS recipient_name,\n       c.id            AS company_id,\n       c.name          AS company_name,\n       c.domain\nFROM queued q\nJOIN outreach  o  ON o.id  = q.id\nJOIN leads     l  ON l.id  = o.lead_id\nJOIN people    pe ON pe.id = l.person_id\nJOIN companies c  ON c.id  = l.company_id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ paused: String($env.OUTREACH_PAUSED ?? 'true').toLowerCase() !== 'false', daily_limit: Number($env.OUTREACH_DAILY_LIMIT || 5), per_domain_limit: Number($env.OUTREACH_PER_DOMAIN_LIMIT || 1), batch_size: Number($env.OUTREACH_DISPATCH_BATCH_SIZE || 5), hour_start: Number($env.OUTREACH_WORKING_HOUR_START || 9), hour_end: Number($env.OUTREACH_WORKING_HOUR_END || 17), working_days: String($env.OUTREACH_WORKING_DAYS || '1,2,3,4,5').split(',').map(s => Number(s.trim())).filter(n => n >= 1 && n <= 7), timezone: $env.GENERIC_TIMEZONE || 'UTC' } ) }}"
+        }
+      },
+      "id": "p6-01",
+      "name": "Claim Approved Outreach",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -640,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Every guard lives here. Zero rows out means nothing runs downstream."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.EMAIL_FROM_NAME ? $env.EMAIL_FROM_NAME + ' <' + $env.EMAIL_FROM + '>' : $env.EMAIL_FROM }}",
+        "toEmail": "={{ $json.recipient_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false,
+          "replyTo": "={{ $env.EMAIL_REPLY_TO || $env.EMAIL_FROM }}"
+        }
+      },
+      "id": "e6-02",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        -360,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "smtpOutbound",
+          "name": "SMTP account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "appendAttribution MUST stay false - it appends an n8n advert to the body a human approved."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The message left the building. Record it once, in one transaction: the\n-- outreach row, the conversation the reply will arrive on, the outbound\n-- message itself, and the lead.\n--\n-- Every write is guarded on the state the claim left behind, so replaying this\n-- statement cannot send a second message or double-write a thread.\nWITH p AS (SELECT $1::jsonb AS j),\nsent AS (\n    UPDATE outreach o\n    SET status              = 'sent',\n        sent_at             = now(),\n        provider_message_id = p.j ->> 'message_id',\n        error               = NULL\n    FROM p\n    WHERE o.id = (p.j ->> 'outreach_id')::uuid\n      AND o.status = 'queued'\n    RETURNING o.id, o.lead_id, o.subject, o.body\n),\nconv AS (\n    -- The thread key is the Message-ID the provider reported. WF-08 matches a\n    -- reply back to this row, so a send that produced no id is not threadable\n    -- and the COALESCE below keeps it unique rather than colliding on ''.\n    INSERT INTO conversations (lead_id, channel, external_thread_id, status, last_message_at)\n    SELECT sent.lead_id, 'email',\n           COALESCE(NULLIF(p.j ->> 'message_id', ''), 'outreach:' || sent.id::text),\n           'awaiting_reply', now()\n    FROM sent, p\n    ON CONFLICT (channel, external_thread_id) DO UPDATE\n        SET last_message_at = now()\n    RETURNING id, lead_id\n),\nmsg AS (\n    INSERT INTO messages (conversation_id, direction, author, subject, body,\n                          external_message_id, sent_at)\n    SELECT conv.id, 'outbound', 'agent', sent.subject, sent.body,\n           NULLIF(p.j ->> 'message_id', ''), now()\n    FROM conv, sent, p\n    ON CONFLICT (external_message_id) WHERE external_message_id IS NOT NULL\n        DO NOTHING\n    RETURNING id\n),\nlead AS (\n    UPDATE leads\n    SET status = 'contacted'\n    WHERE id = (SELECT lead_id FROM sent)\n      AND status IN ('pending_approval', 'approved', 'queued')\n    RETURNING id\n)\nSELECT (SELECT id FROM sent)                 AS outreach_id,\n       (SELECT id FROM conv)                 AS conversation_id,\n       (SELECT count(*) FROM msg)::int       AS messages_written,\n       (SELECT count(*) FROM lead)::int      AS leads_contacted,\n       $1::jsonb ->> 'message_id'            AS provider_message_id,\n       $1::jsonb ->> 'recipient_email'       AS recipient_email,\n       $1::jsonb ->> 'company_name'          AS company_name;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ outreach_id: $('Claim Approved Outreach').item.json.outreach_id, recipient_email: $('Claim Approved Outreach').item.json.recipient_email, company_name: $('Claim Approved Outreach').item.json.company_name, message_id: ($json.messageId || '') } ) }}"
+        }
+      },
+      "id": "p6-03",
+      "name": "Record Send",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -80,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "outreach, conversation, message and lead in one transaction."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The provider refused it. Park the row at 'failed' with the reason and tell\n-- a human; do not retry.\n--\n-- docs/workflows.md: \"A send error sets failed with the error text and does not\n-- retry automatically.\" An automatic retry against an unknown error is how one\n-- rejected message becomes four delivered ones, because an SMTP error can\n-- arrive after the message was in fact accepted.\n--\n-- The lead is deliberately not touched. The claim moved the outreach row and\n-- nothing else, so the lead is still where the approval left it.\nWITH p AS (SELECT $1::jsonb AS j),\nfailed AS (\n    UPDATE outreach o\n    SET status = 'failed',\n        error  = left(COALESCE(NULLIF(p.j ->> 'error', ''), 'unknown send error'), 2000)\n    FROM p\n    WHERE o.id = (p.j ->> 'outreach_id')::uuid\n      AND o.status = 'queued'\n    RETURNING o.id, o.lead_id\n),\nalert AS (\n    -- LATERAL so that nothing is queued when the UPDATE matched nothing:\n    -- a dedup_key built from an absent id would be one shared key for every\n    -- such case, which is the opposite of deduplication.\n    SELECT q.*\n    FROM failed\n    CROSS JOIN LATERAL queue_notification(\n        'system',\n        'system:send_failed:' || failed.id::text,\n        'Send failed: ' || COALESCE(NULLIF($1::jsonb ->> 'company_name', ''), 'unknown'),\n        'Recipient: ' || COALESCE(NULLIF($1::jsonb ->> 'recipient_email', ''), 'unknown')\n            || E'\\n' || 'Outreach: ' || failed.id::text\n            || E'\\n\\n' || left(COALESCE(NULLIF($1::jsonb ->> 'error', ''), 'unknown send error'), 900)\n            || E'\\n\\n' || 'The message stays at failed and is not retried. '\n            || 'Inspect it before approving anything else.',\n        'immediate',\n        jsonb_build_object('outreach_id', failed.id, 'kind', 'send_failure'),\n        NULL::uuid,\n        failed.lead_id,\n        interval '1 hour'\n    ) q\n)\nSELECT (SELECT id FROM failed)                       AS outreach_id,\n       (SELECT notification_id FROM alert)           AS notification_id,\n       $1::jsonb ->> 'company_name'                  AS company_name,\n       left(COALESCE($1::jsonb ->> 'error', ''), 300) AS error;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ outreach_id: $('Claim Approved Outreach').item.json.outreach_id, recipient_email: $('Claim Approved Outreach').item.json.recipient_email, company_name: $('Claim Approved Outreach').item.json.company_name, error: ($json.error?.message || $json.error || 'unknown send error') } ) }}"
+        }
+      },
+      "id": "p6-04",
+      "name": "Record Send Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -80,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Parks the row at failed and alerts. Never retries."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d1",
+              "name": "outcome",
+              "value": "sent",
+              "type": "string"
+            },
+            {
+              "id": "d2",
+              "name": "company",
+              "value": "={{ $json.company_name }}",
+              "type": "string"
+            },
+            {
+              "id": "d3",
+              "name": "recipient",
+              "value": "={{ $json.recipient_email }}",
+              "type": "string"
+            },
+            {
+              "id": "d4",
+              "name": "outreach_id",
+              "value": "={{ $json.outreach_id }}",
+              "type": "string"
+            },
+            {
+              "id": "d5",
+              "name": "conversation_id",
+              "value": "={{ $json.conversation_id }}",
+              "type": "string"
+            },
+            {
+              "id": "d6",
+              "name": "provider_message_id",
+              "value": "={{ $json.provider_message_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n6-done",
+      "name": "Dispatch Result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        200,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1",
+              "name": "outcome",
+              "value": "failed",
+              "type": "string"
+            },
+            {
+              "id": "f2",
+              "name": "company",
+              "value": "={{ $json.company_name }}",
+              "type": "string"
+            },
+            {
+              "id": "f3",
+              "name": "outreach_id",
+              "value": "={{ $json.outreach_id }}",
+              "type": "string"
+            },
+            {
+              "id": "f4",
+              "name": "error",
+              "value": "={{ $json.error }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n6-failed",
+      "name": "Dispatch Failure Result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        200,
+        440
+      ]
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Claim Approved Outreach",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Approved Outreach": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Record Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Send Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Send": {
+      "main": [
+        [
+          {
+            "node": "Dispatch Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Send Failure": {
+      "main": [
+        [
+          {
+            "node": "Dispatch Failure Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "wf99ErrorHandler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "instanceId": "ai-sales-machine"
+  }
+}

@@ -1,0 +1,9 @@
+# Keeps the pinned CI actions current. Container images are pinned in
+# .env.example on purpose and bumped by hand after checking release notes -
+# see the comment above POSTGRES_IMAGE there - so docker is not listed here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

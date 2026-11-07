@@ -1,0 +1,44 @@
+# Runs the checks a contributor already runs by hand, on every pull request and
+# every push to main. Nothing here needs secrets or starts the stack (make test
+# starts one throwaway PostgreSQL container): compose is
+# rendered against .env.example, workflows are validated as JSON, and the
+# secrets scan reads tracked files only.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # docker compose config, bash -n on every script, n8n workflow structure.
+      - name: make validate
+        run: make validate
+
+      # Every migration applied to a throwaway PostgreSQL, then postgres/tests
+      # run against the workflows' own SQL. Docker is on the runner; no stack.
+      - name: make test
+        run: make test
+
+      - name: make secrets-scan
+        run: make secrets-scan
+
+      - name: shellcheck
+        run: shellcheck --severity=error scripts/*.sh infra/scripts/*.sh

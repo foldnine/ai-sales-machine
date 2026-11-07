@@ -1,0 +1,33 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste secrets, `.env` contents, or real prospect data.** Security problems go through Security → Report a vulnerability, not an issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: workflow
+    attributes:
+      label: Workflow or component
+      placeholder: e.g. WF-02 company research, migrate.sh, make health
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: "`make health`, the failing n8n execution's error, or `make logs SERVICE=n8n` (redacted)."
+      render: text
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: e.g. macOS 15 / M4 Pro 48GB, native Ollama; or Ubuntu 24.04 + RTX 4090
+    validations:
+      required: true

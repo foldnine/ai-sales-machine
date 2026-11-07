@@ -1,0 +1,1125 @@
+{
+  "id": "wf03ContactEnrichment",
+  "name": "AI Sales — WF-03 Contact Enrichment",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000001",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -320,
+        300
+      ],
+      "notes": "Hourly, per the WF-03 row in docs/workflows.md."
+    },
+    {
+      "parameters": {
+        "fileSelector": "/prompts/enrichment.md",
+        "options": {}
+      },
+      "id": "c0300000-0000-4000-8000-000000000002",
+      "name": "Read Enrichment Prompt",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        -100,
+        300
+      ],
+      "notes": "./prompts is mounted read-only. The file on disk is the single source of truth."
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {
+          "encoding": "utf8"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000003",
+      "name": "Prompt To Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/agents/enrichment/schema.json",
+        "options": {}
+      },
+      "id": "c0300000-0000-4000-8000-000000000004",
+      "name": "Read Enrichment Schema",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {
+          "encoding": "utf8"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000005",
+      "name": "Schema To Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim companies that are worth a contact lookup, and open the run in the same\n-- statement so the agent_runs row is the claim (the pattern WF-04 uses).\n--\n-- docs/workflows.md: \"Only enrich companies that already scored above the\n-- threshold.\" That was written when enrichment cost provider credits. It costs\n-- nothing now, but the rule stays: a contact for a company nobody will write to\n-- is personal data held for no reason, which docs/security.md calls out under\n-- data minimisation.\n--\n-- \"Above the threshold\" includes a company that is below it only for want of a\n-- contact. decision_maker_score is 0 until WF-03 finds somebody, and WF-03 only\n-- looked above the band, so a company at 59 with nobody on file could never\n-- rise: on 2026-09-29, 16 NURTURE companies (PostHog 59, Pulse 56) were short\n-- of 60 by less than the 10 points a verified decision maker is worth. They are\n-- enriched now; WF-04 re-scores them from the people table either way.\n--\n-- \"No contact found is a normal outcome. The company stays scored and is not\n-- retried for 30 days.\" The agent_runs row is that memory - there is no retry\n-- column and no migration for one.\n--\n-- The per-domain fetch throttle from 0012 applies here too: WF-02 and WF-03 both\n-- fetch from the same hosts, and the limit is per domain, not per workflow.\n-- A run that died without closing (a restart, the night model swap) left its\n-- companies at 'enriching' for good: two companies sat there from\n-- 2026-09-30 01:00. Two hours with no live run puts them back to 'scored',\n-- recorded as a failed run; three failures within retry_days and the claim\n-- below stops trying the site.\nWITH orphaned AS (\n    SELECT c.id, c.updated_at\n    FROM companies c\n    WHERE c.status = 'enriching'\n      AND c.updated_at < now() - interval '2 hours'\n      AND NOT EXISTS (\n          SELECT 1 FROM agent_runs r\n          WHERE r.company_id = c.id\n            AND r.agent_name = 'enrichment'\n            AND r.status     = 'running'\n            AND r.started_at > now() - interval '2 hours'\n      )\n      AND NOT deploy_draining()\n    FOR UPDATE SKIP LOCKED\n),\norphan_runs AS (\n    INSERT INTO agent_runs (agent_name, company_id, input, status, error, started_at, finished_at)\n    SELECT 'enrichment', o.id, jsonb_build_object('stage', 'orphan_sweep'), 'error',\n           'orphaned: left at enriching since ' || o.updated_at || ' with no live run', o.updated_at, now()\n    FROM orphaned o\n    RETURNING company_id\n),\nrequeued AS (\n    UPDATE companies c\n    SET status = 'scored'\n    FROM orphaned o\n    WHERE c.id = o.id\n      AND c.status = 'enriching'\n    RETURNING c.id\n),\ncandidates AS (\n    SELECT c.id, c.domain\n    FROM companies c\n    WHERE c.status = 'scored'\n      AND (c.score_band IN ('OUTREACH', 'HIGH_PRIORITY', 'HOT')\n           -- ... or that its segment's bar (0024_icp_segments.sql) would let\n           -- through once it has a contact.\n           OR (c.score_band = 'NURTURE'\n               AND c.total_score - COALESCE(c.decision_maker_score, 0) + 10\n                   >= outreach_min_score(c.segment, ($1::jsonb ->> 'min_score')::int))\n           -- ... and every company in an active segment with an offer, whatever\n           -- its score (2026-09-29). The contact is part of qualifying a small\n           -- business, not a reward for it: until then not one of 150 regional\n           -- companies had been looked up, because the queue ran by score and\n           -- the software companies were always ahead. Below 20 is what the\n           -- hard overrides leave (chains, competitors, unreadable sites).\n           OR (c.total_score >= 20\n               AND EXISTS (SELECT 1 FROM icp_segments s\n                           WHERE s.code = c.segment AND s.active AND s.angle IS NOT NULL)))\n      -- Someone contactable already exists: nothing to do.\n      AND NOT EXISTS (\n          SELECT 1 FROM people p\n          WHERE p.company_id = c.id\n            AND p.email IS NOT NULL\n            AND p.email_status IN ('valid', 'catch_all', 'guessed')\n      )\n      -- Tried recently, found nothing. Not again yet.\n      AND NOT EXISTS (\n          SELECT 1 FROM agent_runs r\n          WHERE r.company_id = c.id\n            AND r.agent_name = 'enrichment'\n            AND r.status IN ('success', 'skipped')\n            AND r.started_at > now() - make_interval(days => ($1::jsonb ->> 'retry_days')::int)\n      )\n      -- Failed three times recently: the site keeps killing the run.\n      AND (SELECT count(*) FROM agent_runs r\n           WHERE r.company_id = c.id\n             AND r.agent_name = 'enrichment'\n             AND r.status     IN ('error', 'timeout')\n             AND r.started_at > now() - make_interval(days => ($1::jsonb ->> 'retry_days')::int)) < 3\n      -- Already being enriched by a run that is still alive.\n      AND NOT EXISTS (\n          SELECT 1 FROM agent_runs r\n          WHERE r.company_id = c.id\n            AND r.agent_name = 'enrichment'\n            AND r.status     = 'running'\n            AND r.started_at > now() - interval '15 minutes'\n      )\n      -- A deploy is waiting to restart n8n: claim nothing (0021_deploy_drain.sql).\n      AND NOT deploy_draining()\n      -- A WF-05 night batch has the GPU for the large model (0023_night_drafting.sql).\n      AND NOT night_drafting()\n    -- Segment companies first, then by score: a regional company waiting behind\n    -- software companies forever is how none of them got a contact.\n    ORDER BY (c.segment IS DISTINCT FROM 'infra_startups') DESC, c.total_score DESC, c.updated_at\n    LIMIT ($1::jsonb ->> 'candidate_pool')::int\n    FOR UPDATE SKIP LOCKED\n),\nallowed AS (\n    SELECT id\n    FROM candidates\n    WHERE claim_domain_fetch(\n              domain,\n              make_interval(mins => ($1::jsonb ->> 'domain_cooldown_minutes')::int)\n          )\n    LIMIT ($1::jsonb ->> 'batch_size')::int\n),\nclaimed AS (\n    UPDATE companies\n    SET status = 'enriching'\n    WHERE id IN (SELECT id FROM allowed)\n      AND status = 'scored'\n    RETURNING id, name, domain, website, industry\n),\nopened AS (\n    INSERT INTO agent_runs (agent_name, company_id, input, status, model, started_at)\n    SELECT 'enrichment', claimed.id, $1::jsonb -> 'input', 'running', $1::jsonb ->> 'model', now()\n    FROM claimed\n    RETURNING id AS agent_run_id, company_id\n)\nSELECT o.agent_run_id,\n       c.id            AS company_id,\n       c.name,\n       c.domain::text  AS domain,\n       c.website,\n       c.industry\nFROM opened o\nJOIN companies c ON c.id = o.company_id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ batch_size: Number($env.ENRICH_BATCH_SIZE || 3), min_score: Number($env.OUTREACH_MIN_SCORE) || 60, candidate_pool: Number($env.ENRICH_CANDIDATE_POOL || 15), retry_days: Number($env.ENRICH_RETRY_DAYS || 30), domain_cooldown_minutes: Number($env.RESEARCH_DOMAIN_COOLDOWN_MINUTES || 60), model: $env.OLLAMA_ENRICHMENT_MODEL || $env.OLLAMA_MODEL || 'llama3.1:8b', input: { execution_id: String($execution.id), workflow_id: $workflow.id, stage: 'enrichment' } } ) }}"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000006",
+      "name": "Claim Companies",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        700,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Scored companies above the band, with nobody contactable, not tried in 30 days, outside the domain cooldown."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the page list for one company.\n//\n// Different pages from WF-02 on purpose. WF-02 is looking for evidence of\n// engineering work; this is looking for who to write to, and those live on\n// different pages. /team and /contact are the two that matter and neither is in\n// the research list.\n//\n// A regional business (OpenStreetMap) names its pages in its own language, and\n// no fixed list finds them (0 of 150 regional companies had a contact on\n// 2026-09-29). For those, the homepage's own links to the contact, team and\n// about pages come first, as WF-02 does for research; the fixed list follows.\nconst PATHS = [\n  '/contact', '/contact-us', '/kontakt',\n  '/team', '/our-team', '/about', '/about-us', '/company',\n  '/people', '/leadership', '/management',\n  '/careers', '/jobs',\n  '',\n];\nconst REGIONAL_PATHS = ['/kontakt', '/kontakti', '/o-nama', '/o-nas', '/impressum', '/impresum', '/uvjeti-poslovanja', ''];\nconst USER_AGENT = $env.BOT_USER_AGENT || 'AiSalesMachineBot/1.0 (+https://github.com/foldnine/ai-sales-machine)';\nconst MAX_DISCOVERED = 5;\n\n// Topics, most useful first. Matched against the link's path and its text,\n// lower-cased and without diacritics, in Serbian/Croatian/Bosnian, Slovenian,\n// Macedonian (Latin and Cyrillic) and English.\n// JavaScript's \\b is ASCII-only, so a Cyrillic word would never match it;\n// the boundary is spelled out.\nconst W = (words) => new RegExp('(?:^|[^a-z0-9\\\\u0400-\\\\u04ff])(?:' + words + ')(?=$|[^a-z0-9\\\\u0400-\\\\u04ff])');\nconst TOPICS_ALL = [\n  ['about',    W('o-?nama|o-?nas|za-?nas|ko-?smo|tko-?smo|kdo-?smo|about|company|kompanija|firma|tvrtka|podjetje|o-?firmi|o-?kompaniji|o-?podjetju|за-?нас|о-?нама')],\n  ['services', W('usluge|usluga|storitve|storitev|services?|uslugi|djelatnost|dejavnost|resenja|rjesenja|solutions|sto-?radimo|what-?we-?do|ponuda|услуги|услуге')],\n  ['ordering', W('dostava|isporuka|dostavа|nacin-?placanja|placanje|placanja|kako-?kupiti|kako-?naruciti|narucivanje|narudzb\\\\w*|uslovi|uvjeti|pogoji|reklamacij\\\\w*|shipping|delivery|payment|how-?to-?order|nakup|povprasevanje|posalji-?upit|posaljite-?upit|upit|placilni-?pogoji|nacin-?placila|dostava-?i-?placanje|испорака|достава')],\n  ['careers',  W('karijer\\\\w*|kariera|posao|poslovi|zaposlenje|zaposlitev|zaposljavanje|zaposlavamo|careers?|jobs?|otvorene-?pozicije|oglasi|prakse?|вработување|кариера|каријера')],\n  ['team',     W('tim|team|ekipa|nas-?tim|zaposleni|osoblje|ljudje|people|тим')],\n  ['clients',  W('reference|preporuke|klijenti|stranke|clients|portfolio|mnenja-?strank|projekti|partneri|partners|references')],\n  ['pricing',  W('cenovnik|cjenik|cenik|cene|cijene|cena|cijena|pricing|prices|paketi|ценовник')],\n  ['contact',  W('kontakt\\\\w*|contact|контакт')],\n  // Where a small firm names its director: the impressum and the general terms\n  // (Croatian and Slovenian sites often name the management board there).\n  ['legal',    W('impres+um|imprint|kolofon|uvjeti-?poslovanja|opci-?uvjeti\\\\w*|uslovi-?poslovanja|uslovi-?koriscenja|uslovi-?kupovine|pogoji-?poslovanja|splosni-?pogoji|pravne-?(napomene|informacije|obavijesti)|podaci-?o-?(tvrtki|firmi|kompaniji)|o-?tvrtki|legal|terms')],\n];\n\nconst helpers = this.helpers;\n\nconst fold = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')\n  .replace(/đ/g, 'dj').replace(/ł/g, 'l');\n\nfunction robotsBlocksAll(text) {\n  // Only the one question this node needs answered before reading the\n  // homepage: is the whole site closed to us? Allowed URLs applies the full\n  // rules to every page afterwards.\n  let applies = false;\n  for (const raw of String(text || '').split(/\\r?\\n/)) {\n    const line = raw.replace(/#.*$/, '').trim();\n    const m = line.match(/^([a-z-]+)\\s*:\\s*(.*)$/i);\n    if (!m) continue;\n    const field = m[1].toLowerCase();\n    const value = m[2].trim();\n    if (field === 'user-agent') applies = value === '*' || value.toLowerCase().startsWith('aisalesmachinebot');\n    else if (applies && field === 'disallow' && value === '/') return true;\n  }\n  return false;\n}\n\nasync function get(url) {\n  try {\n    const body = await helpers.httpRequest({\n      method: 'GET', url, timeout: 15000, headers: { 'User-Agent': USER_AGENT },\n    });\n    return typeof body === 'string' ? body : '';\n  } catch (e) {\n    return '';\n  }\n}\n\n// No URL class in n8n's task runner (ReferenceError on 2026-09-29), so links\n// are resolved by hand: absolute, protocol-relative, root-relative, relative.\nfunction resolve(href, site) {\n  const h = href.trim();\n  if (/^(mailto|tel|javascript|data|sms|viber|whatsapp):/i.test(h)) return null;\n  let abs;\n  if (/^https?:\\/\\//i.test(h)) abs = h;\n  else if (h.startsWith('//')) abs = 'https:' + h;\n  else if (h.startsWith('/')) abs = site + h;\n  else if (/^[a-z][a-z0-9+.-]*:/i.test(h)) return null;\n  else abs = site + '/' + h.replace(/^\\.\\//, '');\n  const m = abs.match(/^(https?):\\/\\/([^/?#:]+)(?::\\d+)?([^?#]*)/i);\n  if (!m) return null;\n  return { protocol: m[1].toLowerCase(), hostname: m[2].toLowerCase(), pathname: m[3] || '/' };\n}\n\nasync function discover(site) {\n  if (robotsBlocksAll(await get(site + '/robots.txt'))) return { links: [], note: 'robots.txt closes the site' };\n  const html = await get(site + '/');\n  if (!html) return { links: [], note: 'homepage unreadable' };\n  const host = (resolve(site, site) || { hostname: '' }).hostname.replace(/^www\\./, '');\n  const seen = new Map();\n  const re = /<a\\b[^>]*?href\\s*=\\s*[\"']([^\"'#]+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;\n  let m;\n  while ((m = re.exec(html)) !== null) {\n    const u = resolve(m[1], site);\n    if (!u || u.hostname.replace(/^www\\./, '') !== host) continue;\n    const path = u.pathname.replace(/\\/+$/, '');\n    if (!path || /\\.(jpe?g|png|gif|svg|webp|pdf|docx?|xlsx?|zip|css|js|xml|ico)$/i.test(path)) continue;\n    if (/wp-(content|json|admin|login)|xmlrpc|\\/feed\\b|\\/tag\\/|\\/category\\/|\\/cart|\\/korpa|\\/kosarica|\\/account|\\/login/i.test(path)) continue;\n    const key = site + path;\n    const text = fold(m[2].replace(/<[^>]+>/g, ' ')).replace(/\\s+/g, ' ').trim().slice(0, 80);\n    let decoded = path;\n    try { decoded = decodeURIComponent(path); } catch (e) { /* malformed escape: keep it raw */ }\n    const hay = fold(decoded).replace(/[_/.]+/g, '-') + ' ' + text.replace(/\\s+/g, '-');\n    // A slug longer than a page name is an article (\"koji-su-propisani-uslovi-\n    // za-registraciju-lekarske-ordinacije\" matched \"uslovi\" on 2026-09-29).\n    const slug = path.split('/').pop();\n    if (slug.length > 45) continue;\n    if (!seen.has(key)) seen.set(key, { url: key, hay, depth: path.split('/').length, len: path.length });\n  }\n  const picked = [];\n  for (const [topic, rx] of TOPICS) {\n    const hit = [...seen.values()]\n      .filter((l) => rx.test(l.hay) && !picked.some((p) => p.url === l.url))\n      .sort((a, b) => a.depth - b.depth || a.len - b.len)[0];\n    if (hit) picked.push({ ...hit, topic });\n    if (picked.length >= MAX_DISCOVERED) break;\n  }\n  return { links: picked.map((p) => p.url), topics: picked.map((p) => p.topic), note: seen.size + ' links on the homepage' };\n}\n\nconst WANTED = ['contact', 'legal', 'team', 'about', 'careers'];\nconst TOPICS = TOPICS_ALL.filter(([t]) => WANTED.includes(t))\n  .sort((a, b) => WANTED.indexOf(a[0]) - WANTED.indexOf(b[0]));\n\nconst out = [];\nfor (const item of $input.all()) {\n  const c = item.json;\n  // A claim that found nothing comes out of the Postgres node as one item,\n  // {success: true}. Read as a company it was https://undefined/robots.txt,\n  // and WF-03 failed every hour from 2026-09-30 to 2026-10-01.\n  if (!c.company_id || !c.domain) continue;\n  const site = typeof c.website === 'string' && /^https?:\\/\\//i.test(c.website)\n    ? c.website.replace(/\\/+$/, '')\n    : 'https://' + c.domain;\n\n  let urls = PATHS.map((p) => site + p);\n  if (/^OSM /.test(String(c.industry || ''))) {\n    const found = (await discover(site)).links.filter((u) => u.replace(/\\/+$/, '') !== site);\n    urls = [...found];\n    for (const p of REGIONAL_PATHS) if (!urls.includes(site + p)) urls.push(site + p);\n  }\n\n  out.push({\n    json: {\n      ...c,\n      base_url: site,\n      robots_url: site + '/robots.txt',\n      candidate_urls: urls,\n      user_agent: USER_AGENT,\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "c0300000-0000-4000-8000-000000000007",
+      "name": "Contact URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ],
+      "notes": "Different pages from WF-02: /team and /contact are where people are named."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.robots_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 3
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000008",
+      "name": "Fetch robots.txt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "notes": "Same rule as WF-02. A research bot that ignores robots.txt gets the IP blocked.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Apply robots.txt before fetching anything.\n//\n// This is a copy of the same node in WF-02, with the upstream node renamed.\n// n8n has no way to share a function between workflows short of a sub-workflow\n// call, and a sub-workflow for sixty lines of parsing would cost more than it\n// saves. IF YOU CHANGE THE PARSING HERE, CHANGE IT IN WF-02 TOO - the whole\n// point of honouring robots.txt is that it is honoured everywhere.\n//\nfunction parseRobots(text, agent) {\n  const groups = [];\n  let current = null;\n  for (const rawLine of String(text).split(/\\r?\\n/)) {\n    const line = rawLine.replace(/#.*$/, '').trim();\n    if (!line) continue;\n    const idx = line.indexOf(':');\n    if (idx === -1) continue;\n    const field = line.slice(0, idx).trim().toLowerCase();\n    const value = line.slice(idx + 1).trim();\n\n    if (field === 'user-agent') {\n      if (!current || current.rules.length) {\n        current = { agents: [], rules: [] };\n        groups.push(current);\n      }\n      current.agents.push(value.toLowerCase());\n    } else if ((field === 'allow' || field === 'disallow') && current) {\n      current.rules.push({ allow: field === 'allow', path: value });\n    }\n  }\n\n  const token = agent.split('/')[0].toLowerCase();\n  const exact = groups.find((g) => g.agents.includes(token));\n  const wildcard = groups.find((g) => g.agents.includes('*'));\n  return (exact || wildcard || { rules: [] }).rules;\n}\n\nfunction isAllowed(path, rules) {\n  let best = null;\n  for (const rule of rules) {\n    // An empty Disallow means \"allow everything\" and matches nothing.\n    if (rule.path === '') continue;\n    const pattern = rule.path.replace(/\\*+$/, '');\n    if (!path.startsWith(pattern)) continue;\n    if (best === null || pattern.length > best.length) {\n      best = { length: pattern.length, allow: rule.allow };\n    }\n  }\n  return best === null ? true : best.allow;\n}\n\nconst companies = $('Contact URLs').all();\nconst out = [];\n\nfor (let i = 0; i < $input.all().length; i++) {\n  const company = companies[i].json;\n  const res = $input.all()[i].json ?? {};\n\n  // neverError is on, so a 404 arrives as data, not as an exception. Either way\n  // an unreadable robots.txt means no restrictions were published.\n  const body = typeof res.data === 'string' ? res.data : '';\n  const rules = body ? parseRobots(body, company.user_agent) : [];\n\n  const allowed = [];\n  const blocked = [];\n  for (const url of company.candidate_urls) {\n    const path = url.slice(company.base_url.length) || '/';\n    (isAllowed(path, rules) ? allowed : blocked).push(url);\n  }\n\n  out.push({\n    json: {\n      ...company,\n      urls: allowed,\n      robots_blocked: blocked,\n      robots_rules_found: rules.length,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "c0300000-0000-4000-8000-000000000009",
+      "name": "Allowed URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "notes": "A copy of WF-02's parser. Change one and change the other."
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "urls",
+        "include": "allOtherFields",
+        "options": {
+          "destinationFieldName": "url"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-00000000000a",
+      "name": "Split URLs",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        2900,
+        300
+      ],
+      "notes": "allOtherFields because the HTTP node replaces the item json and would lose company_id."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 3
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": "={{ Number($env.RESEARCH_FETCH_BATCH_SIZE || 1) }}",
+              "batchInterval": "={{ Number($env.RESEARCH_FETCH_BATCH_INTERVAL_MS || 1000) }}"
+            }
+          }
+        }
+      },
+      "id": "c0300000-0000-4000-8000-00000000000b",
+      "name": "Fetch Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3100,
+        300
+      ],
+      "notes": "One request at a time by default. domain_fetch_log is the limit between runs; this is the limit inside one.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per fetched page arrives here. Group them back per company.\n//\n// The difference from WF-02's version of this node is what it keeps. WF-02\n// strips tags to plain text, which throws away every mailto: link on the page -\n// and a mailto: href is the single most reliable published address there is,\n// because a human put it there to be clicked. They are pulled out of the raw\n// HTML before anything is stripped.\n\nconst MAX_CHARS_PER_PAGE = 5000;\nconst MAX_CHARS_TOTAL = 20000;\nconst MAX_EMAILS = 40;\n\n// Deliberately narrow. A greedy pattern matches version strings, image hashes\n// and CSS selectors, and every false positive becomes something the verifier\n// has to reject later.\nconst GH_LINK = /github\\.com\\/([A-Za-z0-9][A-Za-z0-9-]{0,38})(?![A-Za-z0-9-])/gi;\n\n// Paths under github.com that are GitHub's own, not a company account.\nconst GH_RESERVED = new Set([\n  'features', 'about', 'pricing', 'enterprise', 'login', 'join', 'marketplace',\n  'explore', 'topics', 'collections', 'events', 'sponsors', 'readme', 'orgs',\n  'apps', 'settings', 'site', 'security', 'customer-stories', 'trending',\n  'search', 'new', 'notifications', 'issues', 'pulls', 'codespaces', 'sitemap',\n]);\n\n// Addresses and names that belong to machinery rather than to a person.\n\nfunction harvestGithubLinks(html) {\n  const out = [];\n  GH_LINK.lastIndex = 0;\n  let m;\n  while ((m = GH_LINK.exec(String(html))) !== null) {\n    const slug = m[1];\n    if (GH_RESERVED.has(slug.toLowerCase())) continue;\n    if (!out.includes(slug)) out.push(slug);\n    if (out.length > 8) break;\n  }\n  return out;\n}\n\nconst EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}/g;\n\nfunction htmlToText(html) {\n  return String(html)\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<\\/(p|div|li|h[1-6]|tr|section|article|td)>/gi, '\\n')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#0?39;|&apos;/gi, \"'\")\n    .replace(/[ \\t ]+/g, ' ')\n    .replace(/\\n\\s*\\n\\s*\\n+/g, '\\n\\n')\n    .trim();\n}\n\n// Some sites write addresses as \"name (at) example.com\" to defeat scrapers.\n// Undoing that is reading what the page says, not defeating anything: the\n// address is published, and the obfuscation is aimed at bulk harvesters.\nfunction deobfuscate(text) {\n  return String(text)\n    .replace(/\\s*\\(\\s*at\\s*\\)\\s*/gi, '@')\n    .replace(/\\s*\\[\\s*at\\s*\\]\\s*/gi, '@')\n    .replace(/\\s+at\\s+([A-Za-z0-9.-]+)\\s+dot\\s+([A-Za-z]{2,})/gi, '@$1.$2')\n    .replace(/\\s*\\(\\s*dot\\s*\\)\\s*/gi, '.')\n    .replace(/\\s*\\[\\s*dot\\s*\\]\\s*/gi, '.');\n}\n\nconst pages = $input.all();\nconst context = $('Split URLs').all();\nconst byCompany = new Map();\n\nfor (let i = 0; i < pages.length; i++) {\n  const j = { ...context[i].json, ...(pages[i].json ?? {}) };\n  const key = j.company_id;\n  if (!key) continue;\n\n  if (!byCompany.has(key)) {\n    byCompany.set(key, {\n      agent_run_id: j.agent_run_id,\n      company_id: j.company_id,\n      name: j.name,\n      domain: j.domain,\n      base_url: j.base_url,\n      robots_blocked: j.robots_blocked ?? [],\n      sources: [],\n      github_hints: [],\n      fetch_failures: [],\n      sections: [],\n      emails: [],\n    });\n  }\n  const bucket = byCompany.get(key);\n\n  const res = pages[i].json ?? {};\n  const failed = res.error !== undefined || typeof res.data !== 'string' || res.data === '';\n  if (failed) {\n    const reason = res.error\n      ? (typeof res.error === 'string' ? res.error : (res.error.message ?? 'request failed'))\n      : 'empty response';\n    bucket.fetch_failures.push(j.url + ' (' + reason + ')');\n    continue;\n  }\n\n  const html = res.data;\n\n  // mailto: first, off the raw HTML, before the tags are gone.\n  for (const m of html.matchAll(/mailto:([^\"'?\\s>]+)/gi)) {\n    const address = decodeURIComponent(m[1]).trim().toLowerCase();\n    if (EMAIL_RE.test(address)) {\n      EMAIL_RE.lastIndex = 0;\n      bucket.emails.push({ email: address, source: j.url, from: 'mailto' });\n    }\n    EMAIL_RE.lastIndex = 0;\n  }\n\n  const text = deobfuscate(htmlToText(html));\n  for (const m of text.matchAll(EMAIL_RE)) {\n    bucket.emails.push({ email: m[0].trim().toLowerCase(), source: j.url, from: 'text' });\n  }\n\n  if (text.length < 40) {\n    bucket.fetch_failures.push(j.url + ' (no usable text)');\n    continue;\n  }\n\n  // Off the raw markup: htmlToText drops the href, and the account name is in\n  // the href.\n  for (const slug of harvestGithubLinks(res.data)) {\n    if (!bucket.github_hints.includes(slug)) bucket.github_hints.push(slug);\n  }\n\n  bucket.sources.push(j.url);\n  bucket.sections.push('### SOURCE: ' + j.url + '\\n' + text.slice(0, MAX_CHARS_PER_PAGE));\n}\n\nconst out = [];\nfor (const bucket of byCompany.values()) {\n  let material = bucket.sections.join('\\n\\n');\n  let truncated = false;\n  if (material.length > MAX_CHARS_TOTAL) {\n    material = material.slice(0, MAX_CHARS_TOTAL);\n    truncated = true;\n  }\n\n  // Deduplicate, keeping the first sighting of each address so its source is\n  // the page it was actually read from.\n  const seen = new Set();\n  const emails = [];\n  for (const e of bucket.emails) {\n    if (seen.has(e.email)) continue;\n    seen.add(e.email);\n    emails.push(e);\n    if (emails.length >= MAX_EMAILS) break;\n  }\n\n  const { sections, emails: _raw, ...rest } = bucket;  // github_hints rides along in rest\n  out.push({\n    json: {\n      ...rest,\n      material,\n      material_chars: material.length,\n      material_truncated: truncated,\n      pages_fetched: bucket.sources.length,\n      // The verifier checks model output against this, so it has to carry the\n      // addresses found in the raw HTML as well as the stripped text.\n      harvested_emails: emails,\n      // Truncation matters here: an address past the cut is not in the material\n      // the model saw, and the verifier would reject it as invented.\n      verification_haystack: (material + '\\n' + emails.map((e) => e.email).join('\\n')).toLowerCase(),\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "c0300000-0000-4000-8000-00000000000c",
+      "name": "Group Material",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        300
+      ],
+      "notes": "Pulls mailto: addresses out of the raw HTML before the tags are stripped."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble the enrichment request. The prompt comes from prompts/enrichment.md\n// and the output contract from agents/enrichment/schema.json, both read from\n// disk, so neither is restated here and neither can drift from this node.\n\nconst MODEL = $env.OLLAMA_ENRICHMENT_MODEL || $env.OLLAMA_MODEL || 'llama3.1:8b';\n\nfunction extractSystemPrompt(markdown) {\n  const section = markdown.split(/^##\\s+System prompt\\s*$/m)[1];\n  if (!section) throw new Error('prompts/enrichment.md: no \"## System prompt\" heading found');\n  const fence = section.match(/```[a-z]*\\n([\\s\\S]*?)\\n```/);\n  if (!fence) throw new Error('prompts/enrichment.md: no fenced block under \"## System prompt\"');\n  const text = fence[1].trim();\n  if (text.length < 200) throw new Error('prompts/enrichment.md: system prompt looks truncated');\n  return text;\n}\n\n// Everything after the system prompt is the working guidance: who to return,\n// what to do with titles, what \"verbatim\" means. The model needs it.\nfunction extractGuidance(markdown) {\n  const start = markdown.indexOf('## Who to return');\n  if (start === -1) throw new Error('prompts/enrichment.md: no \"## Who to return\" section');\n  return markdown.slice(start).trim();\n}\n\nconst doc = $('Prompt To Text').first().json.data;\nconst systemPrompt = extractSystemPrompt(doc) + '\\n\\n' + extractGuidance(doc);\n\nconst schema = JSON.parse($('Schema To Text').first().json.data);\ndelete schema.$schema;\ndelete schema.$id;\ndelete schema.title;\n\nreturn $input.all().map((item) => {\n  const c = item.json;\n\n  const lines = [\n    'COMPANY',\n    'Name: ' + c.name,\n    'Domain: ' + c.domain,\n    '',\n    'ADDRESSES ALREADY FOUND IN THE MARKUP',\n    c.harvested_emails.length\n      ? c.harvested_emails.map((e) => '- ' + e.email + '  (' + e.source + ')').join('\\n')\n      : 'none',\n    '',\n    'PAGES',\n    c.material || '(no readable text was fetched)',\n    '',\n    'Return the people and the role addresses you can read above.',\n    'An empty result is a normal answer.',\n  ];\n\n  return {\n    json: {\n      agent_run_id: c.agent_run_id,\n      company_id: c.company_id,\n      name: c.name,\n      domain: c.domain,\n      model: MODEL,\n      llm_request: {\n        model: MODEL,\n        temperature: 0,\n        max_tokens: 3000,\n        // Transcription, not reasoning. See docs/ollama.md for why this has to\n        // be \"none\" and not \"low\".\n        reasoning_effort: 'none',\n        messages: [\n          { role: 'system', content: systemPrompt },\n          { role: 'user', content: lines.join('\\n') },\n        ],\n        response_format: {\n          type: 'json_schema',\n          json_schema: { name: 'enrichment', strict: true, schema },\n        },\n      },\n    },\n  };\n});\n"
+      },
+      "id": "c0300000-0000-4000-8000-00000000000d",
+      "name": "Build Enrichment Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3500,
+        300
+      ],
+      "notes": "Prompt and schema read from disk, so this node cannot drift from them."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://ollama:11434') + '/v1/chat/completions' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": "={{ $env.ENRICHMENT_MODEL_TIMEOUT_MS || 600000 }}"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-00000000000e",
+      "name": "Enrichment Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3700,
+        300
+      ],
+      "notes": "Local model, no cost. /v1/chat/completions because /api/chat ignores the schema - see docs/ollama.md."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify everything the model said against the pages it was given.\n//\n// docs/architecture.md: the rules that matter are enforced, not requested. The\n// prompt asks the model to transcribe rather than invent; this node is what\n// makes that true. Nothing here trusts a single field of the response.\n//\n// The stakes are not abstract. An address that nobody published goes to a real\n// person at a real company, and the first anyone hears of it is a bounce, a\n// spam complaint, or a reply asking who we are and where we got their details -\n// which under GDPR is a question with a required answer (docs/security.md).\n\nconst ROLE_LOCALPARTS = new Set([\n  'info', 'hello', 'contact', 'kontakt', 'office', 'mail', 'email', 'enquiries',\n  'inquiries', 'jobs', 'careers', 'career', 'recruiting', 'recruitment', 'hr',\n  'posao', 'sales', 'support', 'help', 'admin', 'press', 'media', 'marketing',\n  'billing', 'invoice', 'accounts', 'finance', 'legal', 'privacy', 'security',\n  'abuse', 'postmaster', 'webmaster', 'noreply', 'no-reply', 'donotreply',\n  'newsletter', 'team', 'partners', 'business', 'general',\n  // Serbian, Croatian and Bosnian, and the rest of the outreach allowlist\n  // below, so that none of them can ever be recorded as a person's address.\n  'prodaja', 'ured', 'uprava', 'direkcija', 'management', 'kancelarija',\n  'informacije', 'kontakti', 'enquiry', 'inquiry', 'upit', 'upiti', 'posta',\n  'karijera', 'zaposlenje', 'podrska', 'pomoc', 'racunovodstvo', 'fakture',\n]);\n\n// The role addresses outreach may use, best first. Decided on\n// 2026-09-24: when no named person with an address is found, a company's\n// published general address may be written to, because the companies this\n// targets (small regional businesses) often publish nothing else. Everything\n// NOT on this list stays unusable: jobs, careers, hr, support, help, press,\n// media, marketing, billing, invoices, accounts, finance, legal, privacy,\n// security, abuse, postmaster, webmaster, admin, no-reply, newsletter, team,\n// partners. Those reach a function that is not buying anything, and writing to\n// them is how a sending domain gets blocklisted.\n//\n// The order is who is most likely to read it at a 10-200 person company:\n// management's own inbox first, then the general ones, sales last because it\n// is staffed to answer customers, not suppliers. docs/contact-enrichment.md\n// has the reasons. Migration 0022 carries the same set as\n// is_outreach_role_address(), which refuses a row if the two ever drift.\nconst OUTREACH_ROLE_ORDER = [\n  ['uprava', 'direkcija', 'management', 'office', 'ured', 'kancelarija'],\n  ['info', 'informacije'],\n  ['kontakt', 'kontakti', 'contact'],\n  ['hello'],\n  ['business'],\n  ['enquiries', 'inquiries', 'enquiry', 'inquiry', 'upit', 'upiti'],\n  ['general'],\n  ['mail', 'email', 'posta'],\n  ['sales', 'prodaja'],\n];\nconst outreachRoleRank = (email) => {\n  const local = email.slice(0, email.indexOf('@'));\n  const tier = OUTREACH_ROLE_ORDER.findIndex((t) => t.includes(local));\n  return tier === -1 ? null : tier;\n};\n\nconst EMAIL_SHAPE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$/;\n\nconst SENIORITY = [\n  [/\\b(ceo|chief\\s|cto|cio|ciso|coo|cfo|founder|co-founder|owner|managing director)\\b/i, 'c_level'],\n  [/\\b(vp|vice president)\\b/i, 'vp'],\n  [/\\bhead of\\b/i, 'head'],\n  [/\\bdirector\\b/i, 'director'],\n  [/\\b(manager|lead engineer|engineering manager)\\b/i, 'manager'],\n  [/\\b(lead|principal|staff)\\b/i, 'lead'],\n  [/\\bsenior\\b/i, 'senior'],\n];\n\n// Fold a name to the letters an email address would use: strip diacritics, drop\n// everything that is not a letter. NFD handles c-caron and friends; d-stroke and\n// eszett do not decompose and have to be listed.\nfunction fold(value) {\n  return String(value || '')\n    .normalize('NFD')\n    .replace(/[̀-ͯ]/g, '')\n    .replace(/đ/g, 'd')\n    .replace(/Đ/g, 'd')\n    .replace(/ß/g, 'ss')\n    .replace(/ø/g, 'o')\n    .replace(/ł/g, 'l')\n    .replace(/æ/g, 'ae')\n    .toLowerCase()\n    .replace(/[^a-z]/g, '');\n}\n\n// Ordered most specific first. A single observed address can match more than\n// one of these; the first match wins, so \"first\" and \"last\" alone sit at the\n// bottom where they cannot steal a match from a two-part pattern.\n// Words that make a label a group rather than a person. Smartly.io's site\n// lists \"Agency Teams\", \"Brand Teams\" and \"Creative Teams\"; each passed every\n// check - two words, present on the page - and the pattern inference then\n// produced agency.teams@, brand.teams@ and three more addresses that almost\n// certainly do not exist. docs/security.md forbids writing a role address as a\n// person, but the role check only knows local-parts like \"info\" and \"hello\",\n// and it never sees a name.\nconst COLLECTIVE = new RegExp('(^|\\\\s)(' + [\n  'team', 'teams', 'group', 'groups', 'department', 'dept', 'division',\n  'desk', 'office', 'crew', 'squad', 'staff', 'people', 'personnel',\n  'support', 'sales', 'marketing', 'recruiting', 'recruitment', 'careers',\n  'hr', 'admin', 'administration', 'services', 'partners', 'community',\n  'everyone', 'all', 'us', 'we',\n].join('|') + ')(\\\\s|$)', 'i');\n\n// A person has a given name and a family name. Anything with a company suffix\n// in it is an entity, not somebody to write to.\nconst ENTITY_SUFFIX = /(^|\\s)(inc|llc|ltd|limited|gmbh|bv|b\\.v|oy|ab|as|sa|srl|plc|corp|corporation|company|co)\\.?(\\s|$)/i;\n\nfunction looksLikePerson(fullName, title) {\n  if (COLLECTIVE.test(fullName)) return 'reads as a group, not a person';\n  if (ENTITY_SUFFIX.test(fullName)) return 'reads as a company, not a person';\n  // \"Smartly Team\" arrived with the title \"Team\": when the title is just the\n  // name again, nothing on the page actually identified a person.\n  if (title && fullName.toLowerCase().includes(String(title).toLowerCase()) &&\n      String(title).trim().split(/\\s+/).length < 3) {\n    return 'its title is part of its own name, so no person was identified';\n  }\n  return null;\n}\n\nconst PATTERNS = [\n  { id: 'first.last', build: (f, l) => (f && l ? f + '.' + l : null) },\n  { id: 'f.last',     build: (f, l) => (f && l ? f[0] + '.' + l : null) },\n  { id: 'first_last', build: (f, l) => (f && l ? f + '_' + l : null) },\n  { id: 'first-last', build: (f, l) => (f && l ? f + '-' + l : null) },\n  { id: 'firstlast',  build: (f, l) => (f && l ? f + l : null) },\n  { id: 'flast',      build: (f, l) => (f && l ? f[0] + l : null) },\n  { id: 'last.first', build: (f, l) => (f && l ? l + '.' + f : null) },\n  { id: 'lastf',      build: (f, l) => (f && l ? l + f[0] : null) },\n  { id: 'first',      build: (f) => f || null },\n  { id: 'last',       build: (f, l) => l || null },\n];\n\n// Surname particles. \"Jan van der Berg\" has the surname \"van der Berg\", not\n// \"Berg\", and taking the last word produced jan.berg@example.com for a\n// chief executive - an address that is probably not his. Which form a company\n// uses (pieter.vanderdoes@ or pieter.does@) cannot be known from the name, only\n// from an address that company has actually published.\nconst PARTICLE = /^(van|von|de|der|den|del|della|di|da|do|dos|du|la|le|el|al|bin|ibn|ter|ten|op|af|av|mac|mc|st)$/i;\n\nfunction nameParts(fullName) {\n  const parts = String(fullName || '').trim().split(/\\s+/).filter(Boolean);\n  if (parts.length === 0) return { first: '', last: '', particle: false };\n  // The surname starts at the first particle, when there is one after the\n  // given name, and runs to the end.\n  let start = parts.length - 1;\n  for (let i = 1; i < parts.length - 1; i++) {\n    if (PARTICLE.test(parts[i])) { start = i; break; }\n  }\n  const surname = parts.slice(start).join('');\n  return {\n    first: fold(parts[0]),\n    last: fold(surname),\n    // Recorded so derivation can refuse: both forms are plausible and nothing\n    // observed on this domain says which one is used.\n    particle: start < parts.length - 1,\n  };\n}\n\nfunction seniorityFromTitle(title) {\n  for (const [re, value] of SENIORITY) if (re.test(String(title || ''))) return value;\n  return 'unknown';\n}\n\nconst claims = $('Claim Companies').all();\nconst material = $('Merge GitHub Contacts').all();\nconst requests = $('Build Enrichment Request').all();\nconst responses = $input.all();\n\nconst out = [];\n\nfor (let i = 0; i < responses.length; i++) {\n  const req = requests[i].json;\n  const mat = material[i].json;\n  const res = responses[i].json ?? {};\n\n  const errors = [];\n  const notes = [];\n  const dropped = [];\n  let parsed = null;\n  let raw = '';\n  let usage = null;\n\n  // ---- the response itself -------------------------------------------------\n  if (res.error !== undefined) {\n    const e = res.error;\n    errors.push('Enrichment model request failed: ' +\n      (typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e)));\n  } else {\n    usage = res.usage ?? null;\n    const choice = Array.isArray(res.choices) ? res.choices[0] : null;\n    if (!choice) {\n      errors.push('Response contained no choices');\n    } else if (choice.finish_reason === 'length') {\n      errors.push('Response hit the token limit and is truncated. Use a model with a ' +\n        'larger context window (OLLAMA_ENRICHMENT_MODEL)');\n    } else {\n      raw = (choice.message && choice.message.content) || '';\n      if (!raw.trim()) errors.push('Model returned no text content');\n      else {\n        try { parsed = JSON.parse(raw); } catch (e) {\n          errors.push('Response is not valid JSON: ' + e.message);\n        }\n      }\n    }\n  }\n  if (parsed !== null && (typeof parsed !== 'object' || Array.isArray(parsed))) {\n    errors.push('Response is valid JSON but not a JSON object');\n    parsed = null;\n  }\n\n  if (errors.length) {\n    out.push({ json: {\n      agent_run_id: req.agent_run_id, company_id: req.company_id,\n      name: req.name, domain: req.domain,\n      valid: false, has_people: false, has_contacts: false, run_status: 'error',\n      errors, error_message: errors.join('; '), notes: [], people: [], role_contact: null, role_addresses: [],\n      dropped: [], pattern: null, raw_response: raw, model_output: parsed, usage,\n    } });\n    continue;\n  }\n\n  const haystack = String(mat.verification_haystack || '');\n  const domain = String(req.domain || '').toLowerCase();\n  const harvested = new Map((mat.harvested_emails || []).map((e) => [e.email, e.source]));\n\n  const onCompanyDomain = (email) => {\n    const at = email.lastIndexOf('@');\n    if (at === -1) return false;\n    const host = email.slice(at + 1);\n    return host === domain || host.endsWith('.' + domain);\n  };\n  const isRole = (email) => ROLE_LOCALPARTS.has(email.slice(0, email.indexOf('@')));\n\n  // An address is only accepted if the pages actually contain it. The harvest\n  // is the stronger check - it came out of the markup - but the haystack covers\n  // an address the harvester's pattern missed.\n  // A local model asked for a nullable field often answers with the string\n  // \"null\" rather than JSON null. Treating that as a rejected address filled\n  // the audit trail with drops for people who simply had no address, which\n  // makes the real drops - the invented ones - harder to see.\n  const ABSENT = new Set(['', 'null', 'none', 'n/a', 'na', 'unknown', 'undefined', '-']);\n\n  function acceptEmail(candidate, who) {\n    if (!candidate) return null;\n    const email = String(candidate).trim().toLowerCase();\n    if (ABSENT.has(email)) return null;\n    if (!EMAIL_SHAPE.test(email)) { dropped.push(who + ': \"' + candidate + '\" is not an address'); return null; }\n    if (!harvested.has(email) && !haystack.includes(email)) {\n      dropped.push(who + ': address \"' + email + '\" does not appear on any fetched page');\n      return null;\n    }\n    if (!onCompanyDomain(email)) {\n      dropped.push(who + ': address \"' + email + '\" is not on ' + domain);\n      return null;\n    }\n    return email;\n  }\n\n  // ---- people --------------------------------------------------------------\n  const rawPeople = Array.isArray(parsed.people) ? parsed.people : [];\n  const people = [];\n  const usedEmails = new Set();\n  // people carries a unique index on (company_id, lower(btrim(full_name))), and\n  // Write People inserts every row in one statement. Two rows with the same\n  // name abort the whole statement with \"ON CONFLICT DO UPDATE command cannot\n  // affect row a second time\", so the company loses its entire enrichment run\n  // over one repeated name. The model does repeat names - it reads the same\n  // person off two pages - and only addresses were being deduplicated.\n  const usedNames = new Set();\n  const nameKey = (s) => String(s).trim().replace(/\\s+/g, ' ').toLowerCase();\n\n  for (const p of rawPeople) {\n    const fullName = String(p.full_name || '').trim().replace(/\\s+/g, ' ');\n    if (fullName.length < 3 || !/\\s/.test(fullName)) {\n      dropped.push('person \"' + fullName + '\": not a full name');\n      continue;\n    }\n    // An invented person cannot survive this. Whitespace is normalised on both\n    // sides because a name can be split across markup.\n    const foldedName = fullName.toLowerCase();\n    const firstWord = foldedName.split(' ')[0];\n    const lastWord = foldedName.split(' ').pop();\n    if (!haystack.includes(foldedName) && !(haystack.includes(firstWord) && haystack.includes(lastWord))) {\n      dropped.push('person \"' + fullName + '\": name does not appear on any fetched page');\n      continue;\n    }\n\n    if (usedNames.has(nameKey(fullName))) {\n      dropped.push('person \"' + fullName + '\": already listed on another page');\n      continue;\n    }\n\n    const notPerson = looksLikePerson(fullName, p.title);\n    if (notPerson) {\n      dropped.push('person \"' + fullName + '\": ' + notPerson);\n      continue;\n    }\n\n    let title = p.title === null || p.title === undefined ? null : String(p.title).trim();\n    if (title && !haystack.includes(title.toLowerCase())) {\n      notes.push('title \"' + title + '\" for ' + fullName + ' is not on the page; dropped');\n      title = null;\n    }\n\n    let email = acceptEmail(p.email, 'person \"' + fullName + '\"');\n    if (email && isRole(email)) {\n      dropped.push('person \"' + fullName + '\": ' + email + ' is a role address, not a person');\n      email = null;\n    }\n    if (email && usedEmails.has(email)) {\n      dropped.push('person \"' + fullName + '\": ' + email + ' was already claimed by another person');\n      email = null;\n    }\n    if (email) usedEmails.add(email);\n\n    usedNames.add(nameKey(fullName));\n    const parts = fullName.split(' ');\n    people.push({\n      full_name: fullName,\n      first_name: parts[0],\n      last_name: parts.length > 1 ? parts[parts.length - 1] : null,\n      title,\n      seniority: seniorityFromTitle(title),\n      email,\n      email_status: email ? 'valid' : 'unknown',\n      linkedin_url: typeof p.linkedin_url === 'string' && /^https?:\\/\\/(www\\.)?linkedin\\.com\\//i.test(p.linkedin_url)\n        ? p.linkedin_url : null,\n      source_url: email ? (harvested.get(email) || String(p.source || '')) : String(p.source || ''),\n      discovery_method: email ? 'published_page' : null,\n    });\n  }\n\n  // ---- contacts observed in the company's own repositories ----------------\n  // Not model output, so not verified against the pages: each pair is a name\n  // and an address that git recorded together in a commit on this company's\n  // own repository. That is the observation docs/security.md requires before\n  // any address may be derived, and the website never provides it - eleven\n  // companies of this profile were checked and none published one.\n  //\n  // These are appended rather than merged over the model's people: a person the\n  // model already found keeps the title it read off the page.\n  for (const g of (Array.isArray(mat.github_people) ? mat.github_people : [])) {\n    const email = String(g.email || '').toLowerCase();\n    const fullName = String(g.full_name || '').trim();\n    if (!email || !fullName) continue;\n    if (usedEmails.has(email)) continue;\n    if (isRole(email)) continue;\n    // The unique index is on (company_id, lower(trim(full_name))), so a name\n    // the model already reported must not be inserted twice.\n    if (usedNames.has(nameKey(fullName))) continue;\n    if (looksLikePerson(fullName, null)) continue;\n    usedEmails.add(email);\n    usedNames.add(nameKey(fullName));\n\n    const parts = fullName.split(/\\s+/);\n    people.push({\n      full_name: fullName,\n      first_name: parts[0],\n      last_name: parts.length > 1 ? parts[parts.length - 1] : null,\n      title: null,\n      seniority: null,\n      email,\n      email_status: 'valid',\n      linkedin_url: null,\n      source_url: String(g.source_url || ''),\n      // A commit, not a page: kept distinct so the provenance audit in\n      // docs/security.md can tell the two apart. See migration 0016.\n      discovery_method: 'git_commit',\n    });\n  }\n  if ((mat.github_people || []).length) {\n    notes.push('observed ' + mat.github_people.length + ' address(es) in commits on ' +\n      (mat.github_org ? 'github.com/' + mat.github_org : 'the company repositories') +\n      ' (account found by ' + (mat.github_org_via || 'unknown') + ')');\n  }\n\n  // ---- role addresses ------------------------------------------------------\n  // Every verified one is recorded in the run output, as before. A role\n  // address has no person behind it, so it is never written as a person.\n  const roleAddresses = [];\n  for (const r of (Array.isArray(parsed.role_addresses) ? parsed.role_addresses : [])) {\n    const email = acceptEmail(r.email, 'role address');\n    if (!email) continue;\n    roleAddresses.push({ email, purpose: r.purpose ? String(r.purpose).slice(0, 120) : null,\n                         source: harvested.get(email) || String(r.source || '') });\n  }\n\n  // ---- pattern inference ---------------------------------------------------\n  // The one place an address is produced rather than read, and it only happens\n  // when this company's own site already showed one built the same way.\n  //\n  // Scoring across every observed pair, not just the first: two people whose\n  // addresses disagree about the pattern means there is no pattern, and\n  // guessing anyway is how you write to somebody who does not exist.\n  const observed = people.filter((p) => p.email && p.first_name && p.last_name);\n  const tally = new Map();\n  for (const p of observed) {\n    const local = p.email.slice(0, p.email.indexOf('@'));\n    const { first, last } = nameParts(p.full_name);\n    for (const pattern of PATTERNS) {\n      if (pattern.build(first, last) === local) {\n        tally.set(pattern.id, (tally.get(pattern.id) || 0) + 1);\n        break; // first match only: the list is ordered most specific first\n      }\n    }\n  }\n\n  let chosen = null;\n  if (tally.size > 0) {\n    const ranked = [...tally.entries()].sort((a, b) => b[1] - a[1]);\n    if (ranked.length === 1 || ranked[0][1] > ranked[1][1]) {\n      chosen = ranked[0][0];\n    } else {\n      notes.push('observed addresses disagree about the pattern (' +\n        ranked.map(([id, n]) => id + ' x' + n).join(', ') + '); nothing was derived');\n    }\n  }\n\n  let derived = 0;\n  if (chosen) {\n    // Did any observed address actually demonstrate a particle surname? If one\n    // did, the pattern has been proven against that shape and may be applied.\n    const particleProven = observed.some((p) => nameParts(p.full_name).particle);\n    const builder = PATTERNS.find((p) => p.id === chosen);\n    const example = observed.find((p) => {\n      const { first, last } = nameParts(p.full_name);\n      return builder.build(first, last) === p.email.slice(0, p.email.indexOf('@'));\n    });\n    for (const p of people) {\n      if (p.email) continue;\n      const { first, last, particle } = nameParts(p.full_name);\n      // A surname with a particle has two plausible written forms and nothing\n      // observed here says which this company uses. Guessing is exactly what\n      // docs/security.md forbids, and the cost of being wrong is a message to\n      // somebody who is not the person - or to nobody at all.\n      if (particle && !particleProven) {\n        notes.push('no address derived for \"' + p.full_name +\n          '\": the surname carries a particle and no observed address on this ' +\n          'domain shows how that is written');\n        continue;\n      }\n      const local = builder.build(first, last);\n      if (!local || local.length < 2) continue;\n      const candidate = local + '@' + domain;\n      if (usedEmails.has(candidate) || harvested.has(candidate)) continue;\n      usedEmails.add(candidate);\n      p.email = candidate;\n      p.email_status = 'guessed';\n      p.discovery_method = 'pattern_inferred';\n      // The source is the page that proved the pattern, not a page containing\n      // this address - there is none, and pretending otherwise would make\n      // source_url a lie.\n      p.source_url = example ? example.source_url : (mat.sources || [])[0] || null;\n      derived += 1;\n    }\n    notes.push('address pattern \"' + chosen + '\" observed in ' + tally.get(chosen) +\n      ' published address(es); ' + derived + ' further address(es) derived from it');\n  } else if (people.some((p) => !p.email)) {\n    notes.push('no address pattern could be observed on this domain, so no address was derived');\n  }\n\n  // ---- a role contact, only when nobody named can be reached ---------------\n  // At most one, and only when no person above ended with an address -\n  // published, from a commit or derived. A named person always wins; Write\n  // People re-checks against the people already on file for this company.\n  //\n  // Candidates are the model's role addresses and every address harvested out\n  // of the markup (the model does not always list a footer's info@). Each must\n  // have passed the same checks as any address - on a fetched page, on the\n  // company's own domain - and its source must be a page on the company's own\n  // site: an address seen only in a commit (Merge GitHub Contacts adds those to\n  // the harvest with the commit as source) was recorded for attribution, not\n  // published to be written to.\n  const onCompanySite = (url) => {\n    const m = /^https?:\\/\\/([^/:?#]+)/i.exec(String(url || ''));\n    if (!m) return false;\n    const host = m[1].toLowerCase();\n    return host === domain || host.endsWith('.' + domain);\n  };\n  let roleContact = null;\n  if (!people.some((p) => p.email)) {\n    const candidates = new Map();\n    const consider = (email, source) => {\n      if (!email || candidates.has(email) || usedEmails.has(email)) return;\n      if (!onCompanyDomain(email)) return;\n      if (!harvested.has(email) && !haystack.includes(email)) return;\n      const src = harvested.get(email) || source;\n      if (!onCompanySite(src)) return;\n      const rank = outreachRoleRank(email);\n      if (rank === null) return;\n      candidates.set(email, { email, rank, source_url: src });\n    };\n    for (const r of roleAddresses) consider(r.email, r.source);\n    for (const [email, source] of harvested) {\n      if (EMAIL_SHAPE.test(email)) consider(email, source);\n    }\n    const unusable = [...new Set([...roleAddresses.map((r) => r.email), ...harvested.keys()])]\n      .filter((e) => isRole(e) && onCompanyDomain(e) && outreachRoleRank(e) === null);\n    const best = [...candidates.values()].sort((a, b) => a.rank - b.rank || a.email.localeCompare(b.email))[0];\n    if (best) {\n      roleContact = { email: best.email, source_url: best.source_url };\n      notes.push('no named person with an address; the general address ' + best.email +\n        ' (published on ' + best.source_url + ') is the contact');\n    } else if (unusable.length) {\n      notes.push('no named person with an address, and no general address outreach may use (' +\n        unusable.join(', ') + ' are not for sales mail)');\n    }\n  }\n\n  if (rawPeople.length && !people.length) {\n    notes.push('every person the model returned failed verification; treated as nothing found');\n  }\n  if (!mat.pages_fetched) {\n    notes.push('no page was readable: ' + (mat.fetch_failures || []).slice(0, 3).join(', '));\n  }\n\n  out.push({ json: {\n    agent_run_id: req.agent_run_id,\n    company_id: req.company_id,\n    name: req.name,\n    domain: req.domain,\n    valid: true,\n    has_people: people.length > 0,\n    // What \"Anything Found?\" routes on: a role contact alone is worth writing.\n    has_contacts: people.length > 0 || roleContact !== null,\n    run_status: people.length > 0 || roleContact !== null ? 'success' : 'skipped',\n    errors: [],\n    error_message: null,\n    notes,\n    people,\n    role_contact: roleContact,\n    role_addresses: roleAddresses,\n    dropped,\n    pattern: chosen,\n    derived_count: derived,\n    pages_fetched: mat.pages_fetched,\n    sources: mat.sources,\n    raw_response: raw,\n    model_output: parsed,\n    usage,\n  } });\n}\n\nreturn out;\n"
+      },
+      "id": "c0300000-0000-4000-8000-00000000000f",
+      "name": "Validate And Verify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3900,
+        300
+      ],
+      "notes": "Every name and every address is checked against the fetched pages. This node is the whole point of the workflow."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e3-1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0300000-0000-4000-8000-000000000010",
+      "name": "Usable Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4100,
+        300
+      ],
+      "notes": "False means the model failed, not that nothing was found."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e3-2",
+              "leftValue": "={{ $json.has_contacts }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0300000-0000-4000-8000-000000000011",
+      "name": "Anything Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4300,
+        200
+      ],
+      "notes": "Nothing found is a normal outcome and is recorded as 'skipped', not as an error."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write the verified contacts and hand the company back to scoring.\n--\n-- The company goes to 'researched', not to the 'ready' that docs/workflows.md\n-- specifies. 'ready' is a dead end: WF-04 claims 'researched', and it is WF-04\n-- that turns a person into a lead, so a company parked at 'ready' would have a\n-- contact and never a lead. Back to 'researched' means the 15 minute scoring\n-- pass picks it up, re-scores decision_maker from the people table, and creates\n-- the lead. Finding nothing returns it to 'scored' untouched.\nWITH payload AS (SELECT $1::jsonb AS p),\ncand AS (\n    SELECT (payload.p ->> 'company_id')::uuid            AS company_id,\n           person ->> 'full_name'                         AS full_name,\n           NULLIF(person ->> 'first_name', '')            AS first_name,\n           NULLIF(person ->> 'last_name', '')             AS last_name,\n           NULLIF(person ->> 'title', '')                 AS title,\n           NULLIF(person ->> 'seniority', '')             AS seniority,\n           NULLIF(person ->> 'email', '')::citext         AS email,\n           person ->> 'email_status'                      AS email_status,\n           NULLIF(person ->> 'linkedin_url', '')          AS linkedin_url,\n           NULLIF(person ->> 'source_url', '')            AS source_url,\n           NULLIF(person ->> 'discovery_method', '')      AS discovery_method\n    FROM payload, jsonb_array_elements(payload.p -> 'people') AS person\n),\n-- people has a unique index on email. An address that already belongs to a\n-- different row would abort the whole insert, so it is dropped to NULL instead:\n-- the person is still worth recording, and the row that already has the address\n-- is the one that keeps it.\nsafe AS (\n    SELECT c.*,\n           existing.email        AS existing_email,\n           existing.email_status AS existing_status,\n           existing.source_url   AS existing_source,\n           existing.discovery_method AS existing_method,\n           CASE\n               WHEN c.email IS NULL THEN NULL\n               WHEN EXISTS (\n                   SELECT 1 FROM people px\n                   WHERE px.email = c.email\n                     AND NOT (px.company_id = c.company_id\n                              AND lower(btrim(px.full_name)) = lower(btrim(c.full_name)))\n               ) THEN NULL\n               ELSE c.email\n           END AS incoming_email\n    FROM cand c\n    LEFT JOIN people existing\n           ON existing.company_id = c.company_id\n          AND lower(btrim(existing.full_name)) = lower(btrim(c.full_name))\n),\n-- Whether to take the incoming address is ONE decision, and the address, its\n-- status, its source and how it was found all follow from it. Deciding each of\n-- those separately is how a published address kept its status but picked up\n-- discovery_method = 'pattern_inferred' on a re-run, which made the audit trail\n-- say the opposite of the truth.\nresolved AS (\n    SELECT s.*,\n           (s.incoming_email IS NOT NULL\n            AND (s.existing_email IS NULL\n                 OR s.existing_status IS DISTINCT FROM 'valid'\n                 OR s.email_status = 'valid')) AS take_incoming\n    FROM safe s\n),\nins AS (\n    INSERT INTO people (\n        company_id, full_name, first_name, last_name, title, seniority,\n        email, email_status, linkedin_url, source_url, discovery_method\n    )\n    SELECT company_id, full_name, first_name, last_name, title, seniority,\n           CASE WHEN take_incoming THEN incoming_email ELSE existing_email END,\n           CASE WHEN take_incoming THEN email_status\n                ELSE COALESCE(existing_status, 'unknown') END,\n           linkedin_url,\n           COALESCE(CASE WHEN take_incoming THEN source_url ELSE existing_source END, source_url),\n           CASE WHEN take_incoming THEN discovery_method ELSE existing_method END\n    FROM resolved\n    -- EXCLUDED already carries the resolved values, because the decision above\n    -- was made against the row that is being conflicted with.\n    ON CONFLICT (company_id, lower(btrim(full_name))) DO UPDATE\n        SET title            = COALESCE(EXCLUDED.title, people.title),\n            seniority        = COALESCE(EXCLUDED.seniority, people.seniority),\n            linkedin_url     = COALESCE(EXCLUDED.linkedin_url, people.linkedin_url),\n            email            = EXCLUDED.email,\n            email_status     = EXCLUDED.email_status,\n            source_url       = EXCLUDED.source_url,\n            discovery_method = EXCLUDED.discovery_method\n    RETURNING id, email, email_status\n),\ncontactable AS (\n    SELECT count(*)::int AS n FROM ins WHERE email IS NOT NULL\n),\n-- The company's published general address, as a kind = 'role' row with no\n-- name (0022_role_contacts.sql). Validate And Verify only proposes one when no\n-- person in this run ended with an address; this re-checks against the people\n-- already on file, because a named person found on an earlier run wins too.\n-- Suppression is checked here so a suppressed address never becomes a contact.\n--\n-- At most one per company (people_one_role_per_company_key). A company that\n-- already has one keeps it - a lead may already point at it - and the row is\n-- only touched so that it counts as found this run.\nrole_cand AS (\n    SELECT (payload.p ->> 'company_id')::uuid                  AS company_id,\n           (payload.p #>> '{role_contact,email}')::citext       AS email,\n           payload.p #>> '{role_contact,source_url}'            AS source_url\n    FROM payload\n    WHERE jsonb_typeof(payload.p -> 'role_contact') = 'object'\n      AND (SELECT n FROM contactable) = 0\n      AND NOT EXISTS (\n          SELECT 1 FROM people px\n          WHERE px.company_id = (payload.p ->> 'company_id')::uuid\n            AND px.kind = 'person'\n            AND px.email IS NOT NULL\n            AND px.email_status IN ('valid', 'catch_all', 'guessed')\n      )\n      AND NOT is_suppressed((payload.p #>> '{role_contact,email}')::citext)\n      -- Another row already holds the address; people_email_key would abort\n      -- the whole statement, and the row that has it keeps it.\n      AND NOT EXISTS (\n          SELECT 1 FROM people px\n          WHERE px.email = (payload.p #>> '{role_contact,email}')::citext\n            AND NOT (px.company_id = (payload.p ->> 'company_id')::uuid AND px.kind = 'role')\n      )\n),\nrole_ins AS (\n    INSERT INTO people (company_id, kind, full_name, email, email_status, source_url, discovery_method)\n    SELECT company_id, 'role', NULL, email, 'valid', source_url, 'published_page'\n    FROM role_cand\n    ON CONFLICT (company_id) WHERE kind = 'role' DO UPDATE\n        SET source_url = CASE WHEN people.email = EXCLUDED.email\n                              THEN EXCLUDED.source_url ELSE people.source_url END\n    RETURNING id, email, email_status\n),\nupd AS (\n    UPDATE companies\n    SET status = CASE WHEN (SELECT n FROM contactable) > 0\n                        OR EXISTS (SELECT 1 FROM role_ins)\n                      THEN 'researched' ELSE 'scored' END\n    -- From the payload, not from cand: a company with only a role contact has\n    -- no people to take its id from, and would stay 'enriching' for good.\n    WHERE id = (SELECT (p ->> 'company_id')::uuid FROM payload)\n      AND status = 'enriching'\n    RETURNING id, status\n)\nSELECT (SELECT count(*) FROM ins)::int      AS people_written,\n       (SELECT n FROM contactable)          AS contactable_written,\n       (SELECT count(*) FROM role_ins)::int AS role_contacts_written,\n       (SELECT email::text FROM role_ins)   AS role_contact_email,\n       (SELECT status FROM upd)             AS company_status,\n       $1::jsonb ->> 'agent_run_id'         AS agent_run_id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ company_id: $json.company_id, agent_run_id: $json.agent_run_id, people: $json.people, role_contact: $json.role_contact } ) }}"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000012",
+      "name": "Write People",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4520,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Hands the company back to 'researched' so WF-04 re-scores it and creates the lead."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE agent_runs\nSET status        = 'success',\n    output        = $1::jsonb -> 'output',\n    error         = NULL,\n    prompt_tokens = ($1::jsonb #>> '{usage,prompt_tokens}')::int,\n    output_tokens = ($1::jsonb #>> '{usage,completion_tokens}')::int,\n    finished_at   = now()\nWHERE id = ($1::jsonb ->> 'agent_run_id')::uuid\nRETURNING id, company_id, status, duration_ms;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ agent_run_id: $('Validate And Verify').item.json.agent_run_id, usage: $('Validate And Verify').item.json.usage, output: { people: $('Validate And Verify').item.json.people, role_addresses: $('Validate And Verify').item.json.role_addresses, role_contact: $('Validate And Verify').item.json.role_contact, dropped: $('Validate And Verify').item.json.dropped, notes: $('Validate And Verify').item.json.notes, pattern: $('Validate And Verify').item.json.pattern, derived_count: $('Validate And Verify').item.json.derived_count, sources: $('Validate And Verify').item.json.sources, people_written: $json.people_written, contactable_written: $json.contactable_written, role_contacts_written: $json.role_contacts_written, model_output: $('Validate And Verify').item.json.model_output } } ) }}"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000013",
+      "name": "Close Run Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4740,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "dropped is kept: what the model invented is as informative as what it read."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1",
+              "name": "company",
+              "value": "={{ $('Validate And Verify').item.json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "e2",
+              "name": "domain",
+              "value": "={{ $('Validate And Verify').item.json.domain }}",
+              "type": "string"
+            },
+            {
+              "id": "e3",
+              "name": "people_written",
+              "value": "={{ $('Write People').item.json.people_written }}",
+              "type": "number"
+            },
+            {
+              "id": "e4",
+              "name": "contactable",
+              "value": "={{ $('Write People').item.json.contactable_written }}",
+              "type": "number"
+            },
+            {
+              "id": "e5",
+              "name": "pattern",
+              "value": "={{ $('Validate And Verify').item.json.pattern || 'none' }}",
+              "type": "string"
+            },
+            {
+              "id": "e6",
+              "name": "derived",
+              "value": "={{ $('Validate And Verify').item.json.derived_count }}",
+              "type": "number"
+            },
+            {
+              "id": "e7",
+              "name": "company_status",
+              "value": "={{ $('Write People').item.json.company_status }}",
+              "type": "string"
+            },
+            {
+              "id": "e8",
+              "name": "dropped",
+              "value": "={{ $('Validate And Verify').item.json.dropped.join(' | ') }}",
+              "type": "string"
+            },
+            {
+              "id": "e9",
+              "name": "notes",
+              "value": "={{ $('Validate And Verify').item.json.notes.join(' | ') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c0300000-0000-4000-8000-000000000014",
+      "name": "Enriched",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4960,
+        100
+      ],
+      "notes": "A run that found people. company_status should read 'researched'."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Nothing usable came back. Put the company back exactly where it was and let\n-- the 30 day window in the claim query keep it there.\n--\n-- The run is closed as 'error' only when the model itself failed. A company\n-- whose pages simply do not name anybody is a 'skipped' run: it is not a fault,\n-- and recording it as one would make the WF-101 error rate meaningless.\nWITH payload AS (SELECT $1::jsonb AS p),\nupd AS (\n    UPDATE companies\n    SET status = 'scored'\n    FROM payload\n    WHERE companies.id = (payload.p ->> 'company_id')::uuid\n      AND companies.status = 'enriching'\n    RETURNING companies.id\n),\nrun AS (\n    UPDATE agent_runs\n    SET status      = payload.p ->> 'run_status',\n        error       = CASE WHEN payload.p ->> 'run_status' = 'error'\n                           THEN COALESCE(NULLIF(payload.p ->> 'error', ''), 'Enrichment failed with no message')\n                           ELSE NULL END,\n        output      = payload.p -> 'output',\n        finished_at = now()\n    FROM payload\n    WHERE agent_runs.id = (payload.p ->> 'agent_run_id')::uuid\n    RETURNING agent_runs.id, agent_runs.status\n)\nSELECT (SELECT count(*) FROM upd)::int AS companies_released,\n       (SELECT status FROM run)        AS run_status,\n       $1::jsonb ->> 'company_id'      AS company_id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ company_id: $json.company_id, agent_run_id: $json.agent_run_id, run_status: $json.run_status, error: $json.error_message, output: { people: $json.people, role_addresses: $json.role_addresses, dropped: $json.dropped, notes: $json.notes, errors: $json.errors, pages_fetched: $json.pages_fetched, raw_response: $json.raw_response } } ) }}"
+        }
+      },
+      "id": "c0300000-0000-4000-8000-000000000015",
+      "name": "Release Company",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4520,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Both the 'found nothing' and the 'model failed' paths. The company goes back to 'scored' either way."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "r1",
+              "name": "company",
+              "value": "={{ $('Validate And Verify').item.json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "r2",
+              "name": "domain",
+              "value": "={{ $('Validate And Verify').item.json.domain }}",
+              "type": "string"
+            },
+            {
+              "id": "r3",
+              "name": "run_status",
+              "value": "={{ $json.run_status }}",
+              "type": "string"
+            },
+            {
+              "id": "r4",
+              "name": "pages_fetched",
+              "value": "={{ $('Validate And Verify').item.json.pages_fetched }}",
+              "type": "number"
+            },
+            {
+              "id": "r5",
+              "name": "dropped",
+              "value": "={{ $('Validate And Verify').item.json.dropped.join(' | ') }}",
+              "type": "string"
+            },
+            {
+              "id": "r6",
+              "name": "notes",
+              "value": "={{ $('Validate And Verify').item.json.notes.join(' | ') }}",
+              "type": "string"
+            },
+            {
+              "id": "r7",
+              "name": "note",
+              "value": "Back to 'scored'. Not retried for ENRICH_RETRY_DAYS.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c0300000-0000-4000-8000-000000000016",
+      "name": "Released",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4740,
+        420
+      ],
+      "notes": "No contact found is a normal outcome, not a failure."
+    },
+    {
+      "parameters": {
+        "jsCode": "// One search per company, to find the GitHub account by name.\n//\n// Guessing the account from the domain costs a call per guess out of the 60 an\n// hour the unauthenticated API allows, and still misses: miro.com's account is\n// \"miroapp\" and no guess reaches that. Search has its own separate budget of 10\n// a minute, so asking it once per company is both cheaper and better.\n//\n// A wrong account is self-correcting further down: commit authors are kept only\n// when the address is on the company's own domain, so an unrelated account\n// yields nothing rather than yielding somebody else's engineers.\n\nconst GH_LINK = /github\\.com\\/([A-Za-z0-9][A-Za-z0-9-]{0,38})(?![A-Za-z0-9-])/gi;\nconst GH_RESERVED = new Set([\n  'features', 'about', 'pricing', 'enterprise', 'login', 'join', 'marketplace',\n  'explore', 'topics', 'collections', 'events', 'sponsors', 'readme', 'orgs',\n  'apps', 'settings', 'site', 'security', 'customer-stories', 'trending',\n  'search', 'new', 'notifications', 'issues', 'pulls', 'codespaces', 'sitemap',\n]);\n\nconst out = [];\nfor (const item of $input.all()) {\n  const c = item.json;\n  if (String($env.ENRICH_GITHUB_ENABLED || 'true') !== 'true') continue;\n\n  const hints = (c.github_hints || []).filter((h) => !GH_RESERVED.has(String(h).toLowerCase()));\n  const label = String(c.domain || '').toLowerCase().split('.')[0].replace(/[^a-z0-9-]/g, '');\n\n  out.push({ json: {\n    company_id: c.company_id,\n    domain: c.domain,\n    gh_hint: hints[0] || null,\n    // Searched even when there is a hint: the search is on a separate budget,\n    // and the result is only used if the hint turns out not to work.\n    url: 'https://api.github.com/search/users?q=' +\n         encodeURIComponent(label + ' type:org') + '&per_page=5',\n  } });\n}\n\nif (!out.length) {\n  out.push({ json: { company_id: null, gh_noop: true,\n    url: 'https://api.github.com/search/users?q=__none__+type:org' } });\n}\n\nreturn out;\n"
+      },
+      "id": "gh-search",
+      "name": "GitHub Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ $env.GITHUB_TOKEN ? 'Bearer ' + $env.GITHUB_TOKEN : undefined }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 2
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": "={{ Number($env.ENRICH_GITHUB_INTERVAL_MS || 400) }}"
+            }
+          }
+        }
+      },
+      "id": "fetch-gh-repos",
+      "name": "Fetch GitHub Repos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1940,
+        300
+      ],
+      "notes": "Public GitHub API. GITHUB_TOKEN is optional: without it the limit is 60 calls an hour, which fits ENRICH_BATCH_SIZE=3 hourly and little more.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Choose the account that answered, and ask it for commits.\n//\n// The unauthenticated GitHub API allows 60 calls an hour. A company costs one\n// call per candidate account plus one per repository read, so the candidate\n// list is kept short and a repository with no recent pushes is not read at all.\n\nconst MAX_REPOS = Number($env.ENRICH_GITHUB_MAX_REPOS || 3);\nconst COMMITS_PER_REPO = Number($env.ENRICH_GITHUB_COMMITS_PER_REPO || 40);\n\nconst candidates = $('Resolve Org').all();\nconst responses = $input.all();\n\n// company_id -> the first candidate account that returned repositories\nconst chosen = new Map();\nconst rate = { remaining: null };\n\nfor (let i = 0; i < responses.length; i++) {\n  const cand = (candidates[i] && candidates[i].json) || {};\n  if (!cand.company_id) continue;\n  if (chosen.has(cand.company_id)) continue;\n\n  const res = (responses[i] && responses[i].json) || {};\n  const body = typeof res.data === 'string' ? res.data : '';\n  if (!body) continue;\n  let repos;\n  try { repos = JSON.parse(body); } catch { continue; }\n  if (!Array.isArray(repos) || !repos.length) continue;\n\n  chosen.set(cand.company_id, { cand, repos });\n}\n\nconst out = [];\nfor (const [companyId, { cand, repos }] of chosen) {\n  const usable = repos\n    .filter((r) => r && r.name && !r.archived && !r.fork)\n    .slice(0, MAX_REPOS);\n  for (const r of usable) {\n    out.push({ json: {\n      company_id: companyId,\n      domain: cand.domain,\n      gh_org: cand.gh_org,\n      gh_via: cand.gh_via,\n      repo: r.name,\n      url: 'https://api.github.com/repos/' + encodeURIComponent(cand.gh_org) +\n           '/' + encodeURIComponent(r.name) + '/commits?per_page=' + COMMITS_PER_REPO,\n    } });\n  }\n}\n\nif (!out.length) {\n  out.push({ json: { company_id: null, gh_noop: true,\n    url: 'https://api.github.com/repos/__none__/__none__/commits' } });\n}\n\nreturn out;\n"
+      },
+      "id": "pick-repos",
+      "name": "Pick Repos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ $env.GITHUB_TOKEN ? 'Bearer ' + $env.GITHUB_TOKEN : undefined }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 2
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": "={{ Number($env.ENRICH_GITHUB_INTERVAL_MS || 400) }}"
+            }
+          }
+        }
+      },
+      "id": "fetch-gh-commits",
+      "name": "Fetch GitHub Commits",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2340,
+        300
+      ],
+      "notes": "Commit metadata only. The author address is part of the commit object.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn commit authors into observed contacts for this company.\n//\n// These are not model output and are not guesses: each one is a name and an\n// address that appeared together in a commit on the company's own repository.\n// They are handed to Validate And Verify as already-verified, which is what\n// lets its existing pattern inference run at all - docs/security.md requires a\n// real address observed on the domain before any address may be derived.\n\nconst MACHINE = /(^|[^a-z])(bot|ci|cd|jenkins|travis|circleci|actions|deploy|release|automation|renovate|dependabot|snyk|greenkeeper|semantic-release)([^a-z]|$)|noreply|no-reply|^git@|^root@|^admin@/i;\n\nfunction fold(s) {\n  return String(s || '')\n    .normalize('NFD').replace(/[̀-ͯ]/g, '')\n    .replace(/đ/gi, 'd').replace(/ß/g, 'ss').replace(/ø/gi, 'o')\n    .replace(/ł/gi, 'l').replace(/æ/gi, 'ae')\n    .toLowerCase().replace(/[^a-z]/g, '');\n}\n\n// Pull (name, address, commit url) out of a commits listing, keeping only\n// addresses on the company's own domain and only humans.\nfunction commitAuthors(commits, domain) {\n  const byEmail = new Map();\n  // Also keyed by name, because people.full_name carries a unique index per\n  // company. One engineer committing from two addresses - a personal alias and\n  // a team one - produced two rows with the same name in a single INSERT, and\n  // Postgres rejects the whole statement with \"ON CONFLICT DO UPDATE command\n  // cannot affect row a second time\". That failed the entire enrichment run for\n  // the company, not just the duplicate.\n  const seenNames = new Set();\n  if (!Array.isArray(commits)) return [];\n  const dom = String(domain || '').toLowerCase();\n  for (const cm of commits) {\n    const c = (cm && cm.commit) || {};\n    for (const who of [c.author, c.committer]) {\n      const email = String((who && who.email) || '').trim().toLowerCase();\n      const name = String((who && who.name) || '').trim();\n      if (!email || !name) continue;\n      const host = email.slice(email.lastIndexOf('@') + 1);\n      if (host !== dom && !host.endsWith('.' + dom)) continue;\n      if (MACHINE.test(email) || MACHINE.test(name)) continue;\n      // A single word is a handle, not a name, and the pattern check needs\n      // both halves to prove anything.\n      const parts = name.split(/\\s+/).filter(Boolean);\n      if (parts.length < 2) continue;\n      if (!fold(parts[0]) || !fold(parts[parts.length - 1])) continue;\n      const nameKey = name.trim().toLowerCase();\n      if (!byEmail.has(email) && !seenNames.has(nameKey)) {\n        seenNames.add(nameKey);\n        byEmail.set(email, { full_name: name, email, source_url: cm.html_url || '' });\n      }\n    }\n  }\n  return [...byEmail.values()];\n}\n\nconst MAX_PEOPLE = Number($env.ENRICH_GITHUB_MAX_PEOPLE || 12);\n\nconst companies = $('Group Material').all();\nconst requests = $('Pick Repos').all();\nconst responses = $input.all();\n\nconst byCompany = new Map();\nconst orgOf = new Map();\n\nfor (let i = 0; i < responses.length; i++) {\n  const req = (requests[i] && requests[i].json) || {};\n  if (!req.company_id) continue;\n  orgOf.set(req.company_id, { org: req.gh_org, via: req.gh_via });\n\n  const res = (responses[i] && responses[i].json) || {};\n  const body = typeof res.data === 'string' ? res.data : '';\n  if (!body) continue;\n  let commits;\n  try { commits = JSON.parse(body); } catch { continue; }\n\n  if (!byCompany.has(req.company_id)) byCompany.set(req.company_id, new Map());\n  const bucket = byCompany.get(req.company_id);\n  for (const a of commitAuthors(commits, req.domain)) {\n    if (!bucket.has(a.email)) bucket.set(a.email, a);\n  }\n}\n\nconst out = [];\nfor (const item of companies) {\n  const c = { ...item.json };\n  const found = [...(byCompany.get(c.company_id) || new Map()).values()].slice(0, MAX_PEOPLE);\n  const org = orgOf.get(c.company_id) || {};\n\n  const harvested = Array.isArray(c.harvested_emails) ? c.harvested_emails.slice() : [];\n  let haystack = String(c.verification_haystack || '');\n\n  if (found.length) {\n    for (const p of found) {\n      if (!harvested.some((h) => h.email === p.email)) {\n        harvested.push({ email: p.email, source: p.source_url });\n      }\n      haystack += '\\n' + p.full_name.toLowerCase() + '\\n' + p.email;\n    }\n  }\n\n  const { github_hints: _drop, ...rest } = c;\n  out.push({ json: {\n    ...rest,\n    harvested_emails: harvested,\n    verification_haystack: haystack,\n    github_people: found,\n    github_org: org.org || null,\n    github_org_via: org.via || null,\n    github_people_count: found.length,\n  } });\n}\n\nreturn out;\n"
+      },
+      "id": "merge-gh",
+      "name": "Merge GitHub Contacts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ $env.GITHUB_TOKEN ? 'Bearer ' + $env.GITHUB_TOKEN : undefined }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 2
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": "={{ Number($env.ENRICH_GITHUB_INTERVAL_MS || 400) }}"
+            }
+          }
+        }
+      },
+      "id": "fetch-gh-search",
+      "name": "Fetch GitHub Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        300
+      ],
+      "notes": "GitHub org search. Separate rate budget from the core API (10/min unauthenticated), so one per company is cheap.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Settle on one account per company and ask it for repositories.\n//\n// A link the company published on its own pages beats a search result; the\n// search is the fallback for the companies that publish no link, which was two\n// of the eleven measured and includes miro.com.\n\nconst searches = $('GitHub Search').all();\nconst responses = $input.all();\n\nfunction bestFromSearch(body, label) {\n  let d;\n  try { d = JSON.parse(body); } catch { return null; }\n  const items = Array.isArray(d && d.items) ? d.items : [];\n  if (!items.length) return null;\n  const want = String(label || '').replace(/[^a-z0-9]/g, '');\n  // An exact match on the login beats GitHub's own ranking; otherwise take the\n  // top hit, which is what put \"miroapp\" first for \"miro\".\n  const exact = items.find((u) => String(u.login || '').toLowerCase().replace(/[^a-z0-9]/g, '') === want);\n  return String(((exact || items[0]) || {}).login || '') || null;\n}\n\nconst out = [];\nfor (let i = 0; i < responses.length; i++) {\n  const req = (searches[i] && searches[i].json) || {};\n  if (!req.company_id) continue;\n\n  const body = typeof (responses[i] && responses[i].json && responses[i].json.data) === 'string'\n    ? responses[i].json.data : '';\n  const label = String(req.domain || '').split('.')[0];\n  const searched = bestFromSearch(body, label);\n\n  const org = req.gh_hint || searched;\n  if (!org) continue;\n\n  out.push({ json: {\n    company_id: req.company_id,\n    domain: req.domain,\n    gh_org: org,\n    gh_via: req.gh_hint ? 'link' : 'search',\n    gh_alt: req.gh_hint && searched && searched !== req.gh_hint ? searched : null,\n    url: 'https://api.github.com/orgs/' + encodeURIComponent(org) + '/repos?sort=pushed&per_page=5',\n  } });\n}\n\nif (!out.length) {\n  out.push({ json: { company_id: null, gh_noop: true,\n    url: 'https://api.github.com/orgs/__none__/repos' } });\n}\n\nreturn out;\n"
+      },
+      "id": "resolve-org",
+      "name": "Resolve Org",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Read Enrichment Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Enrichment Prompt": {
+      "main": [
+        [
+          {
+            "node": "Prompt To Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt To Text": {
+      "main": [
+        [
+          {
+            "node": "Read Enrichment Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Enrichment Schema": {
+      "main": [
+        [
+          {
+            "node": "Schema To Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schema To Text": {
+      "main": [
+        [
+          {
+            "node": "Claim Companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Companies": {
+      "main": [
+        [
+          {
+            "node": "Contact URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contact URLs": {
+      "main": [
+        [
+          {
+            "node": "Fetch robots.txt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch robots.txt": {
+      "main": [
+        [
+          {
+            "node": "Allowed URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed URLs": {
+      "main": [
+        [
+          {
+            "node": "Split URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split URLs": {
+      "main": [
+        [
+          {
+            "node": "Fetch Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Page": {
+      "main": [
+        [
+          {
+            "node": "Group Material",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group Material": {
+      "main": [
+        [
+          {
+            "node": "GitHub Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Enrichment Request": {
+      "main": [
+        [
+          {
+            "node": "Enrichment Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrichment Agent": {
+      "main": [
+        [
+          {
+            "node": "Validate And Verify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate And Verify": {
+      "main": [
+        [
+          {
+            "node": "Usable Response?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Usable Response?": {
+      "main": [
+        [
+          {
+            "node": "Anything Found?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything Found?": {
+      "main": [
+        [
+          {
+            "node": "Write People",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write People": {
+      "main": [
+        [
+          {
+            "node": "Close Run Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close Run Success": {
+      "main": [
+        [
+          {
+            "node": "Enriched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Release Company": {
+      "main": [
+        [
+          {
+            "node": "Released",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch GitHub Repos": {
+      "main": [
+        [
+          {
+            "node": "Pick Repos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Repos": {
+      "main": [
+        [
+          {
+            "node": "Fetch GitHub Commits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch GitHub Commits": {
+      "main": [
+        [
+          {
+            "node": "Merge GitHub Contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge GitHub Contacts": {
+      "main": [
+        [
+          {
+            "node": "Build Enrichment Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub Search": {
+      "main": [
+        [
+          {
+            "node": "Fetch GitHub Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch GitHub Search": {
+      "main": [
+        [
+          {
+            "node": "Resolve Org",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Org": {
+      "main": [
+        [
+          {
+            "node": "Fetch GitHub Repos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "wf99ErrorHandler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

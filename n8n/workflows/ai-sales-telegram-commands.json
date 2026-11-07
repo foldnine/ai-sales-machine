@@ -1,0 +1,407 @@
+{
+  "id": "wf11TelegramCommands",
+  "name": "AI Sales — WF-11 Telegram Commands",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "n11-trigger",
+      "name": "Every 30 Seconds",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1100,
+        300
+      ],
+      "notes": "Polling, not a webhook: Telegram cannot reach this machine."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c11-1",
+              "leftValue": "={{ $env.TELEGRAM_ENABLED }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "c11-2",
+              "leftValue": "={{ $env.TELEGRAM_CHAT_ID }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "c11-3",
+              "leftValue": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "i11-01",
+      "name": "Telegram Configured?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE((value)::text::bigint, 0) AS offset_value\nFROM app_settings WHERE key = 'telegram_update_offset';",
+        "options": {}
+      },
+      "id": "p11-02",
+      "name": "Read Offset",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -660,
+        220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.telegram.org/bot' + $env.TELEGRAM_BOT_TOKEN + '/getUpdates' }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "offset",
+              "value": "={{ Number($json.offset_value || 0) + 1 }}"
+            },
+            {
+              "name": "timeout",
+              "value": "0"
+            },
+            {
+              "name": "limit",
+              "value": "20"
+            },
+            {
+              "name": "allowed_updates",
+              "value": "[\"message\"]"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "h11-03",
+      "name": "Get Updates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -440,
+        220
+      ],
+      "notes": "The token is in this URL because the Telegram API has no header to put it in. This workflow therefore saves no execution data.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn getUpdates into at most one item per command.\n//\n// Authorisation happens here and is repeated in SQL. docs/telegram.md: a\n// message from any other chat is ignored - not answered, not treated as an\n// error. It is still recorded in command_log, because a command arriving from\n// a chat that is not yours is how you find out the bot token has leaked, and\n// a record is not the same as an answer.\n\nconst CHAT_ID = String($env.TELEGRAM_CHAT_ID || '').trim();\nconst body = $input.first().json;\n\nif (!body || body.ok !== true || !Array.isArray(body.result) || body.result.length === 0) {\n  return [];\n}\n\nconst out = [];\nfor (const update of body.result) {\n  const msg = update.message || update.edited_message;\n  if (!msg || typeof msg.text !== 'string') continue;\n\n  const text = msg.text.trim();\n  if (!text.startsWith('/')) continue;\n\n  // \"/approve 7f3a\" and \"/approve@my_bot 7f3a\" are the same command: Telegram\n  // appends the bot name when several bots share a group.\n  const parts = text.slice(1).split(/\\s+/);\n  // Words people actually type for the same thing. command_log shows\n  // \"/accept\" arriving on 2026-09-23 and being answered \"unknown\"; /start is\n  // what Telegram sends when a chat with the bot is opened.\n  const ALIASES = { accept: 'approve', ok: 'approve', decline: 'reject', start: 'help', commands: 'help',\n                   funnel: 'stats', revenue: 'stats' };\n  const typed = parts[0].split('@')[0].toLowerCase();\n  const command = ALIASES[typed] || typed;\n  const argument = parts[1] || null;\n  const reason = parts.slice(2).join(' ') || null;\n\n  out.push({\n    json: {\n      update_id: update.update_id,\n      chat_id: String(msg.chat && msg.chat.id),\n      command,\n      argument,\n      reason,\n      // Every word after the command: /approve takes several ids, /stage an id,\n      // a stage, a value and a note.\n      args: parts.slice(1).filter(Boolean),\n      authorised: CHAT_ID !== '' && String(msg.chat && msg.chat.id) === CHAT_ID,\n    },\n  });\n}\n\n// Highest update_id last, so Save Offset converges on the right number even\n// though it runs once per item.\nout.sort((a, b) => a.json.update_id - b.json.update_id);\nreturn out;"
+      },
+      "id": "c11-04",
+      "name": "Parse Commands",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One command: recorded, applied, and answered, in a single statement.\n--\n-- The record is written before the effect and the effect depends on the\n-- record, so a command cannot take effect without being logged. command_log\n-- has a UNIQUE update_id, so an update that arrives twice - which happens\n-- whenever the offset fails to save after a command was applied - inserts\n-- nothing the second time, and every UPDATE below is guarded on that insert\n-- having happened. Replay is a no-op rather than a second approval.\n--\n-- 2026-09-29: /approve takes several ids at once (\"/approve 7f3a 0c21 9be4\"),\n-- each still one draft the operator read, so twenty approvals are one message, not\n-- twenty. /stats, /pipeline and /stage are the sales side: what the funnel\n-- says, who is talking to us, and where each conversation stands\n-- (0024_icp_segments.sql).\n--\n-- 0026: /stage audit records the paid Process Automation Audit, the amount a\n-- /stage names is kept on its lead_events row (revenue is counted from there),\n-- and /campaigns shows each campaign's funnel (0026_first_revenue.sql).\n--\n-- 0030: /autosend on|off|status and /stop, the operator's switch for guarded autosend\n-- (decided 2026-10-08). The work is autosend_command(), called once per\n-- logged update and only for the authorised chat. /autosend on is refused\n-- while OUTREACH_AUTOSEND_ENABLED, the master switch in .env, is not \"true\".\nWITH p AS (SELECT $1::jsonb AS j),\ncfg AS (\n    SELECT (j ->> 'update_id')::bigint          AS update_id,\n           j ->> 'chat_id'                      AS chat_id,\n           lower(j ->> 'command')               AS command,\n           NULLIF(btrim(j ->> 'argument'), '')  AS argument,\n           NULLIF(btrim(j ->> 'reason'), '')    AS reason,\n           ARRAY(SELECT jsonb_array_elements_text(COALESCE(j -> 'args', '[]'::jsonb))) AS args,\n           (j ->> 'authorised')::boolean        AS authorised,\n           (j ->> 'paused')::boolean            AS paused,\n           COALESCE((j ->> 'autosend_env')::boolean, false) AS autosend_env,\n           j ->> 'languages'                    AS languages,\n           j ->> 'timezone'                     AS timezone\n    FROM p\n),\nres AS (\n    SELECT a.ord, a.arg, r.outreach_id, r.matches\n    FROM cfg\n    CROSS JOIN LATERAL unnest(\n        CASE WHEN cfg.command = 'approve' AND cardinality(cfg.args) > 0 THEN cfg.args\n             ELSE ARRAY[COALESCE(cfg.argument, '')] END\n    ) WITH ORDINALITY AS a(arg, ord)\n    LEFT JOIN LATERAL resolve_outreach_prefix(a.arg) r ON true\n),\n-- /stage <id> <stage> [value in EUR] [note]. The id is a lead's or any of its\n-- drafts' first characters, as /pipeline and the approval messages show them.\nstage_cfg AS (\n    SELECT CASE lower(COALESCE(cfg.args[2], ''))\n               WHEN 'interested' THEN 'opportunity'\n               WHEN 'opportunity' THEN 'opportunity'\n               WHEN 'meeting'    THEN 'meeting'\n               WHEN 'call'       THEN 'meeting'\n               WHEN 'audit'      THEN 'audit'\n               WHEN 'proposal'   THEN 'proposal'\n               WHEN 'won'        THEN 'closed_won'\n               WHEN 'lost'       THEN 'closed_lost'\n               WHEN 'nurture'    THEN 'nurture'\n           END AS stage,\n           CASE WHEN cfg.args[3] ~ '^[0-9]{1,7}$' THEN cfg.args[3]::int END AS value_eur,\n           NULLIF(array_to_string(cfg.args[CASE WHEN cfg.args[3] ~ '^[0-9]{1,7}$' THEN 4 ELSE 3 END:], ' '), '') AS note\n    FROM cfg\n),\nstage_lead AS (\n    SELECT CASE WHEN count(DISTINCT l.id) = 1 THEN (array_agg(l.id))[1] END AS lead_id,\n           count(DISTINCT l.id)::int AS matches\n    FROM cfg, leads l\n    WHERE cfg.command = 'stage'\n      AND length(COALESCE(cfg.argument, '')) >= 4\n      AND (l.id::text LIKE lower(cfg.argument) || '%'\n           OR EXISTS (SELECT 1 FROM outreach o\n                      WHERE o.lead_id = l.id AND o.id::text LIKE lower(cfg.argument) || '%'))\n),\nverdict AS (\n    SELECT CASE\n        WHEN NOT cfg.authorised THEN 'unauthorised'\n        WHEN cfg.command NOT IN ('approve','reject','leads','status','help','stats','pipeline','stage','campaigns',\n                                 'autosend','stop') THEN 'unknown'\n        WHEN cfg.command = 'stop' THEN 'applied'\n        WHEN cfg.command = 'autosend' THEN CASE\n            WHEN lower(COALESCE(cfg.argument, 'status')) NOT IN ('on', 'off', 'status', 'stop') THEN 'bad_autosend'\n            -- The master switch is .env, not Telegram: a phone cannot turn it on.\n            WHEN lower(cfg.argument) = 'on' AND NOT cfg.autosend_env THEN 'refused'\n            ELSE 'applied' END\n        WHEN cfg.command IN ('leads','status','help','stats','pipeline','campaigns') THEN 'applied'\n        WHEN cfg.command = 'stage' THEN CASE\n            WHEN (SELECT matches FROM stage_lead) = 0 THEN 'not_found'\n            WHEN (SELECT matches FROM stage_lead) > 1 THEN 'ambiguous'\n            WHEN (SELECT stage FROM stage_cfg) IS NULL THEN 'bad_stage'\n            ELSE 'applied' END\n        WHEN EXISTS (SELECT 1 FROM res WHERE matches = 1) THEN 'applied'\n        WHEN EXISTS (SELECT 1 FROM res WHERE matches > 1) THEN 'ambiguous'\n        ELSE 'not_found'\n    END AS outcome\n    FROM cfg\n),\nlogged AS (\n    INSERT INTO command_log (update_id, chat_id, command, argument, outcome, detail)\n    SELECT cfg.update_id, cfg.chat_id, cfg.command,\n           CASE WHEN cardinality(cfg.args) > 0 THEN array_to_string(cfg.args, ' ') ELSE cfg.argument END,\n           -- command_log keeps the outcomes 0014 defined; a stage word it does\n           -- not know is logged as not_found.\n           CASE verdict.outcome WHEN 'bad_stage' THEN 'not_found' WHEN 'bad_autosend' THEN 'not_found'\n                                ELSE verdict.outcome END,\n           cfg.reason\n    FROM cfg, verdict\n    ON CONFLICT (update_id) DO NOTHING\n    RETURNING update_id\n),\napproved AS (\n    UPDATE outreach o\n    SET status           = 'approved',\n        approved_by      = 'telegram:' || (SELECT chat_id FROM cfg),\n        approved_at      = now(),\n        rejection_reason = NULL\n    WHERE o.id IN (SELECT outreach_id FROM res WHERE matches = 1)\n      AND o.status = 'pending_approval'\n      AND (SELECT command FROM cfg) = 'approve'\n      AND (SELECT authorised FROM cfg)\n      AND EXISTS (SELECT 1 FROM logged)\n    RETURNING o.id, o.lead_id\n),\nrejected AS (\n    UPDATE outreach o\n    SET status           = 'rejected',\n        rejection_reason = COALESCE((SELECT reason FROM cfg), 'rejected from Telegram')\n    WHERE o.id = (SELECT outreach_id FROM res WHERE matches = 1 ORDER BY ord LIMIT 1)\n      AND o.status = 'pending_approval'\n      AND (SELECT command FROM cfg) = 'reject'\n      AND (SELECT authorised FROM cfg)\n      AND EXISTS (SELECT 1 FROM logged)\n    RETURNING o.id, o.lead_id\n),\nlead_moved AS (\n    UPDATE leads l\n    SET status = CASE WHEN EXISTS (SELECT 1 FROM approved WHERE lead_id = l.id)\n                      THEN 'approved' ELSE 'rejected' END\n    WHERE l.id IN (SELECT lead_id FROM approved UNION ALL SELECT lead_id FROM rejected)\n    RETURNING l.id\n),\nstaged AS (\n    UPDATE leads l\n    SET status         = (SELECT stage FROM stage_cfg),\n        deal_value_eur = COALESCE((SELECT value_eur FROM stage_cfg), l.deal_value_eur)\n    WHERE l.id = (SELECT lead_id FROM stage_lead)\n      AND (SELECT outcome FROM verdict) = 'applied'\n      AND (SELECT command FROM cfg) = 'stage'\n      AND EXISTS (SELECT 1 FROM logged)\n    RETURNING l.id, l.status, l.deal_value_eur, l.company_id\n),\nstage_event AS (\n    INSERT INTO lead_events (lead_id, stage, note, actor, value_eur)\n    SELECT s.id, s.status, (SELECT note FROM stage_cfg), 'telegram:' || (SELECT chat_id FROM cfg),\n           (SELECT value_eur FROM stage_cfg)\n    FROM staged s\n    RETURNING id\n),\n-- /autosend and /stop (0030_autosend.sql). Runs once: only when this update\n-- was logged now, so a replayed /autosend on does not sweep the queue twice.\nautosend AS (\n    SELECT autosend_command(\n               CASE WHEN cfg.command = 'stop' THEN 'off' ELSE lower(COALESCE(cfg.argument, 'status')) END,\n               'telegram:' || cfg.chat_id, cfg.autosend_env, cfg.languages, cfg.timezone, cfg.paused) AS reply\n    FROM cfg, verdict\n    WHERE cfg.command IN ('autosend', 'stop')\n      AND cfg.authorised\n      AND verdict.outcome IN ('applied', 'refused')\n      AND EXISTS (SELECT 1 FROM logged)\n),\n-- The subject of whichever rows were just touched, for the confirmation.\ntouched AS (\n    -- A role contact (0022) has no name; show its address instead of nothing.\n    SELECT string_agg(c.name || ' — ' || COALESCE(pe.full_name, pe.email || ' (general address)'),\n                      E'\\n' ORDER BY c.name) AS text,\n           count(*)::int AS n\n    FROM (SELECT lead_id FROM approved UNION ALL SELECT lead_id FROM rejected\n          UNION ALL SELECT id FROM staged) t\n    JOIN leads l     ON l.id = t.lead_id\n    JOIN companies c ON c.id = l.company_id\n    JOIN people pe   ON pe.id = l.person_id\n),\n-- Ids typed with /approve that did not resolve to exactly one waiting draft.\nmisses AS (\n    SELECT string_agg(format('\"%s\" %s', arg,\n                             CASE WHEN matches > 1 THEN 'matches more than one' ELSE 'matches nothing waiting' END),\n                      E'\\n' ORDER BY ord) AS text\n    FROM res WHERE COALESCE(matches, 0) <> 1\n),\nqueue AS (\n    SELECT COALESCE(\n        string_agg(format('%s  [%s]  %s — %s',\n                          left(outreach_id::text, 4),\n                          COALESCE(score::text, '?'),\n                          company_name,\n                          full_name),\n                   E'\\n' ORDER BY score DESC NULLS LAST),\n        'Nothing is waiting for approval.') AS text\n    FROM v_approval_queue\n),\nstats AS (\n    SELECT format(\n        'Awaiting approval: %s%sSent today: %s%sReplies: %s%sOpen opportunities: %s%sAgent failures: %s%s%sOutbound: %s',\n        awaiting_approval, E'\\n', messages_sent, E'\\n', replies_received, E'\\n',\n        open_opportunities, E'\\n', agent_failures, E'\\n', E'\\n',\n        CASE WHEN (SELECT paused FROM cfg) THEN 'PAUSED' ELSE 'running' END) AS text\n    FROM v_daily_stats\n),\nkpis AS (\n    SELECT concat_ws(E'\\n',\n        'SALES CONVERSATIONS: ' || k.sales_conversations,\n        'Calls ' || k.meetings || ' · audits ' || k.audits || ' · proposals ' || k.proposals ||\n            ' · won ' || k.clients || ' · lost ' || k.lost,\n        'REVENUE €' || k.revenue_eur || ' · open pipeline €' || k.pipeline_eur,\n        '',\n        'Last 24h: discovered ' || k.companies_24h || ' · drafted ' || k.drafted_24h ||\n            ' · approved ' || k.approved_24h || ' · sent ' || k.sent_24h || ' · replies ' || k.replies_24h,\n        '',\n        'Contacted ' || k.leads_contacted || ' leads, ' || k.emails_sent || ' emails (' || k.emails_sent_7d || ' in 7 days)',\n        'Replied ' || k.replied || ' (' || COALESCE(k.reply_rate_pct::text, '-') || '%) · bounced ' || k.bounced ||\n            ' (' || COALESCE(k.bounce_rate_pct::text, '-') || '%) · unsubscribed ' || k.unsubscribed,\n        'Awaiting approval ' || k.awaiting_approval || ' · qualified ' || k.qualified || ' · companies ' || k.companies ||\n            ' (+' || k.companies_7d || ' in 7 days)',\n        '',\n        'By segment (companies / qualified / contacted / replied / conversations):',\n        (SELECT string_agg(format('%s%s: %s / %s / %s / %s / %s', segment, CASE WHEN active THEN '' ELSE ' (off)' END,\n                                  companies, qualified, contacted, replied, conversations), E'\\n')\n         FROM v_segment_results)) AS text\n    FROM v_sales_kpis k\n),\ncampaign_lines AS (\n    SELECT COALESCE(string_agg(concat_ws(E'\\n',\n               r.campaign || CASE WHEN r.active IS FALSE THEN ' (ended)' ELSE '' END ||\n                   COALESCE(' · ' || r.segment || ' · ' || r.message_variant, ''),\n               '  contacted ' || r.contacted || ' · replied ' || r.replied ||\n                   ' (' || COALESCE(r.reply_rate_pct::text, '-') || '%) · conversations ' || r.conversations,\n               '  calls ' || r.calls || ' · audits ' || r.audits || ' · proposals ' || r.proposals ||\n                   ' · won ' || r.won || ' · €' || r.revenue_eur),\n           E'\\n\\n'), 'No campaigns yet.') AS text\n    FROM v_campaign_results r\n),\npipeline AS (\n    SELECT COALESCE(string_agg(format('%s  %s  %s%s%s', left(o.lead_id::text, 4), o.status, c.name,\n                                      CASE WHEN o.deal_value_eur IS NOT NULL THEN ' · €' || o.deal_value_eur ELSE '' END,\n                                      COALESCE(' · last: ' || (\n                                          SELECT m.classification FROM conversations cv JOIN messages m ON m.conversation_id = cv.id\n                                          WHERE cv.lead_id = o.lead_id AND m.direction = 'inbound'\n                                          ORDER BY m.created_at DESC LIMIT 1), '')),\n                               E'\\n' ORDER BY o.status, c.name),\n                    'No conversations yet.') AS text\n    FROM v_lead_outcomes o\n    JOIN companies c ON c.id = o.company_id\n    WHERE o.replied OR o.conversation\n       OR o.status IN ('replied', 'opportunity', 'meeting', 'audit', 'proposal', 'closed_won')\n)\nSELECT (SELECT outcome FROM verdict)                    AS outcome,\n       (SELECT command FROM cfg)                        AS command,\n       (SELECT update_id FROM cfg)                      AS update_id,\n       -- NULL means send nothing. An unauthorised chat gets no answer at all:\n       -- a reply confirms the bot is live and tells the sender they found\n       -- something real.\n       CASE (SELECT outcome FROM verdict)\n           WHEN 'unauthorised' THEN NULL\n           WHEN 'unknown' THEN\n               'Unknown command. /help lists them.'\n           WHEN 'bad_stage' THEN\n               'Which stage? /stage <id> interested|meeting|audit|proposal|won|lost|nurture [value €] [note]'\n           WHEN 'bad_autosend' THEN\n               '/autosend on | /autosend off | /autosend (stanje) | /stop'\n           WHEN 'refused' THEN\n               COALESCE((SELECT reply FROM autosend), 'Već obrađeno.')\n           WHEN 'not_found' THEN\n               CASE WHEN (SELECT argument FROM cfg) IS NULL\n                    THEN CASE WHEN (SELECT command FROM cfg) = 'stage'\n                              THEN 'Which lead? /pipeline lists them.'\n                              ELSE 'Which draft? Say /approve <id> or /reject <id>. /leads lists them.' END\n                    ELSE format('Nothing matches \"%s\".', (SELECT argument FROM cfg))\n               END\n           WHEN 'ambiguous' THEN\n               format('\"%s\" matches more than one. Type more characters.',\n                      (SELECT argument FROM cfg))\n           ELSE CASE (SELECT command FROM cfg)\n               WHEN 'help'   THEN concat_ws(E'\\n',\n                   '/leads - drafts waiting for you, with their ids',\n                   '/approve <id> [<id> ...] - send those drafts in the next window',\n                   '/reject <id> [reason] - drop it; the reason is kept',\n                   '/stats - the sales funnel, revenue, last 24h, results per segment',\n                   '/campaigns - each campaign from contacted to revenue',\n                   '/pipeline - everyone who replied, and where it stands',\n                   '/stage <id> interested|meeting|audit|proposal|won|lost [value €] [note]',\n                   '  audit 1200 = the paid audit; won <€> = what the build is invoiced',\n                   '/status - today in numbers',\n                   '/autosend on|off - first messages that pass every check go out without /approve; /autosend shows the state',\n                   '/stop - autosend off now; drafts it approved and not yet sent come back to you',\n                   '',\n                   'The id is the first characters shown by /leads or /pipeline; four is enough.')\n               WHEN 'leads'    THEN (SELECT text FROM queue)\n               WHEN 'status'   THEN (SELECT text FROM stats)\n               WHEN 'stats'    THEN (SELECT text FROM kpis)\n               WHEN 'pipeline' THEN (SELECT text FROM pipeline)\n               WHEN 'campaigns' THEN (SELECT text FROM campaign_lines)\n               WHEN 'autosend' THEN COALESCE((SELECT reply FROM autosend), 'Već obrađeno.')\n               WHEN 'stop'     THEN COALESCE((SELECT reply FROM autosend), 'Već obrađeno.')\n               WHEN 'stage' THEN\n                   COALESCE((SELECT format('%s: %s%s', (SELECT stage FROM stage_cfg), text,\n                                           COALESCE(' · €' || (SELECT value_eur FROM stage_cfg), '')) FROM touched WHERE n > 0),\n                            'Nothing changed.')\n               WHEN 'approve' THEN\n                   concat_ws(E'\\n',\n                       COALESCE((SELECT format('Approved %s:%s%s%sWF-06 sends in the next window.',\n                                               n, E'\\n', text, E'\\n') FROM touched WHERE n > 0),\n                                'Nothing changed: no draft named is still awaiting approval.'),\n                       (SELECT 'Not approved:' || E'\\n' || text FROM misses WHERE text IS NOT NULL))\n               WHEN 'reject' THEN\n                   COALESCE((SELECT format('Rejected: %s.', text) FROM touched WHERE n > 0),\n                            'Nothing changed: that draft is no longer awaiting approval.')\n           END\n       END AS reply;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ update_id: $json.update_id, chat_id: $json.chat_id, command: $json.command, argument: $json.argument, reason: $json.reason, args: $json.args, authorised: $json.authorised, paused: String($env.OUTREACH_PAUSED ?? 'true').toLowerCase() !== 'false', autosend_env: String($env.OUTREACH_AUTOSEND_ENABLED ?? 'false').trim() === 'true', languages: String($env.OUTREACH_LANGUAGES ?? ''), timezone: $env.GENERIC_TIMEZONE || 'UTC' } ) }}"
+        }
+      },
+      "id": "p11-05",
+      "name": "Apply Command",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Records and applies in one statement. Replay is a no-op."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "r11-1",
+              "leftValue": "={{ $json.reply }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "i11-06",
+      "name": "Reply Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        220,
+        220
+      ],
+      "notes": "An unauthorised chat is answered with silence."
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ String($json.reply ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "t11-07",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        440,
+        140
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "Ss2Ff8xj69SABZq4",
+          "name": "Telegram account"
+        }
+      },
+      "notes": "Uses the credential, so no token in this node. parse_mode empty: command output is data, not markup."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Acknowledge everything up to and including this update.\n--\n-- GREATEST rather than a plain assignment: this node runs once per command in\n-- the batch and n8n does not promise an order, so a late-arriving smaller\n-- number must not walk the offset backwards and replay the batch forever.\nINSERT INTO app_settings (key, value)\nVALUES ('telegram_update_offset', to_jsonb(($1::jsonb ->> 'update_id')::bigint))\nON CONFLICT (key) DO UPDATE\nSET value = to_jsonb(GREATEST(\n        (app_settings.value)::text::bigint,\n        ($1::jsonb ->> 'update_id')::bigint))\nRETURNING key, value;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ update_id: $('Apply Command').item.json.update_id } ) }}"
+        }
+      },
+      "id": "p11-08",
+      "name": "Save Offset",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "After the effect, not before. command_log is what makes the replay safe."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "nc1",
+              "name": "reason",
+              "value": "TELEGRAM_ENABLED, TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN is not set",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n11-noconf",
+      "name": "Not Configured",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -660,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Every 30 Seconds": {
+      "main": [
+        [
+          {
+            "node": "Telegram Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Configured?": {
+      "main": [
+        [
+          {
+            "node": "Read Offset",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Not Configured",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Offset": {
+      "main": [
+        [
+          {
+            "node": "Get Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Updates": {
+      "main": [
+        [
+          {
+            "node": "Parse Commands",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Commands": {
+      "main": [
+        [
+          {
+            "node": "Apply Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Command": {
+      "main": [
+        [
+          {
+            "node": "Reply Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply Needed?": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save Offset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply": {
+      "main": [
+        [
+          {
+            "node": "Save Offset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveExecutionProgress": false,
+    "saveManualExecutions": false,
+    "errorWorkflow": "wf99ErrorHandler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "instanceId": "ai-sales-machine"
+  }
+}

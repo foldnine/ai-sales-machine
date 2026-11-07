@@ -1,0 +1,225 @@
+{
+  "id": "wf12OsmRefresh",
+  "name": "AI Sales — WF-12 OSM Refresh",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 5,
+              "triggerAtMinute": 20
+            }
+          ]
+        }
+      },
+      "id": "w12-trig",
+      "name": "Daily At 05:20",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Which countries to fetch today: those with no snapshot, then the oldest\n-- past DISCOVERY_OSM_REFRESH_DAYS, at most DISCOVERY_OSM_REFRESH_PER_DAY.\n--\n-- The map changes slowly and every query is a whole country, so asking every\n-- morning bought nothing and cost the public instance: on 2026-09-24 it\n-- refused connections from this IP on every backend and port. No rows means\n-- nothing is due, and the workflow ends here.\nWITH p AS (SELECT $1::jsonb AS j)\nSELECT c.iso\nFROM p, unnest(string_to_array(upper(regexp_replace(p.j ->> 'countries', '\\s', '', 'g')), ',')) WITH ORDINALITY AS c(iso, ord)\nLEFT JOIN osm_snapshot s ON s.country = c.iso\nWHERE c.iso ~ '^[A-Z]{2}$'\n  AND (s.country IS NULL OR s.fetched_at < now() - make_interval(days => (p.j ->> 'refresh_days')::int))\nORDER BY s.fetched_at NULLS FIRST, c.ord\nLIMIT (SELECT (j ->> 'per_day')::int FROM p);",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ countries: String($env.DISCOVERY_OSM_COUNTRIES ?? ''), refresh_days: Number($env.DISCOVERY_OSM_REFRESH_DAYS || 7), per_day: Number($env.DISCOVERY_OSM_REFRESH_PER_DAY || 3) }) }}"
+        }
+      },
+      "id": "w12-due",
+      "name": "Countries Due",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// One Overpass query per country due. One query for all six timed out on the\n// public instance; one per country takes 10-60 s.\nreturn $input.all().map((item) => ({ json: { iso: item.json.iso, query:\n  '[out:json][timeout:120];area[\"ISO3166-1\"=\"' + item.json.iso + '\"][admin_level=2]->.a;(' +\n  'nwr[\"office\"][\"website\"](area.a);nwr[\"shop\"][\"website\"](area.a);' +\n  'nwr[\"office\"][\"contact:website\"](area.a);nwr[\"shop\"][\"contact:website\"](area.a););out tags;' } }));"
+      },
+      "id": "w12-q",
+      "name": "OSM Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://overpass-api.de/api/interpreter",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "data",
+              "value": "={{ $json.query }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 150000,
+          "response": {
+            "response": {
+              "neverError": false,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 10000
+            }
+          }
+        }
+      },
+      "id": "w12-fetch",
+      "name": "Fetch OSM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "The public Overpass instance refuses connections or answers 504 under load; five tries five seconds apart. A country that still fails is answered from osm_snapshot by OSM Snapshot, so a bad morning costs nothing.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "w12-check",
+      "name": "Check OSM",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Decide which Overpass responses are good enough to use and to keep.\n//\n// Fetch OSM answers one item per OSM Queries item, in order. A failure is an\n// item with an error and no data. Overpass can also answer 200 with a \"remark\"\n// saying the query ran out of time, and whatever elements it managed: that is\n// a partial country, and keeping it would replace a full snapshot with a\n// fraction of one. Only a complete, non-empty response counts as fresh.\nconst asked = $('OSM Queries').all();\nconst got = $input.all();\nreturn asked.map((a, i) => {\n  const iso = a.json.iso;\n  const raw = got[i] && got[i].json && got[i].json.data;\n  let elements = null;\n  let problem = null;\n  if (!iso) problem = 'disabled';\n  else if (!raw) problem = (got[i] && got[i].json && got[i].json.error && got[i].json.error.message) || 'no response';\n  else {\n    try {\n      const body = JSON.parse(raw);\n      if (body.remark && /error|timed out|runtime/i.test(body.remark)) problem = 'incomplete: ' + body.remark.slice(0, 120);\n      else if (!Array.isArray(body.elements) || body.elements.length === 0) problem = 'no elements';\n      else elements = body.elements.length;\n    } catch (e) { problem = 'not JSON'; }\n  }\n  return { json: { iso, data: problem ? null : raw, elements, problem } };\n});\n"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Keep a complete response as the country's snapshot. A failure writes\n-- nothing, so the country stays due and is asked again tomorrow, while WF-01\n-- goes on using the last good snapshot. osm_snapshot is 0020.\nWITH p AS (SELECT $1::jsonb AS j),\nsaved AS (\n    INSERT INTO osm_snapshot (country, payload, elements, fetched_at)\n    SELECT j ->> 'iso', j ->> 'data', (j ->> 'elements')::int, now()\n    FROM p\n    WHERE coalesce(j ->> 'data', '') <> ''\n    ON CONFLICT (country) DO UPDATE\n        SET payload = EXCLUDED.payload, elements = EXCLUDED.elements, fetched_at = now()\n    RETURNING country, elements\n)\nSELECT (SELECT j ->> 'iso' FROM p)     AS iso,\n       (SELECT elements FROM saved)    AS elements,\n       EXISTS (SELECT 1 FROM saved)    AS saved,\n       (SELECT j ->> 'problem' FROM p) AS problem;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ iso: $json.iso, data: $json.data, elements: $json.elements, problem: $json.problem }) }}"
+        }
+      },
+      "id": "w12-save",
+      "name": "Save Snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily At 05:20": {
+      "main": [
+        [
+          {
+            "node": "Countries Due",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Countries Due": {
+      "main": [
+        [
+          {
+            "node": "OSM Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OSM Queries": {
+      "main": [
+        [
+          {
+            "node": "Fetch OSM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch OSM": {
+      "main": [
+        [
+          {
+            "node": "Check OSM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check OSM": {
+      "main": [
+        [
+          {
+            "node": "Save Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "wf99ErrorHandler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "instanceId": "ai-sales-machine"
+  }
+}

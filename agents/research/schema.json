@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-sales-machine/agents/research/schema.json",
+  "title": "Research agent output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "company_summary",
+    "runs_production",
+    "absence_checks",
+    "infra_people_found",
+    "engineering_people_found",
+    "facts",
+    "technology",
+    "hiring_signals",
+    "pain_signals",
+    "reasonable_inferences",
+    "unknown",
+    "decision_maker_reason",
+    "recommended_service",
+    "why_now",
+    "confidence",
+    "sources"
+  ],
+  "properties": {
+    "company_summary": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "runs_production": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Does the company operate software that customers depend on. null means undetermined, never false-by-default."
+    },
+    "production_evidence": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "What was actually seen that shows the company operates software. Required in practice whenever runs_production is true."
+    },
+    "absence_checks": {
+      "type": "array",
+      "description": "One entry per page actually read to establish a negative. Every claim of absence elsewhere in this output must be backed by an entry here.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "claim",
+          "checked_url",
+          "result"
+        ],
+        "properties": {
+          "claim": {
+            "type": "string",
+            "minLength": 1
+          },
+          "checked_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "absent",
+              "present",
+              "unreadable"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "maxItems": 8
+    },
+    "infra_people_found": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Count of DevOps/SRE/platform/infrastructure people on a page that was read. 0 is the buying signal; null is ignorance. They are not interchangeable."
+    },
+    "engineering_people_found": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Total engineers counted on the same page, so that 0 infra people can be read against a denominator."
+    },
+    "facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fact",
+          "source"
+        ],
+        "properties": {
+          "fact": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source": {
+            "type": "string",
+            "format": "uri"
+          },
+          "observed_at": {
+            "type": "string"
+          }
+        }
+      },
+      "maxItems": 12
+    },
+    "technology": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "evidence",
+          "source",
+          "confidence"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "category": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "format": "uri"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "A fraction from 0.0 to 1.0, e.g. 0.7. Never a percentage."
+          }
+        }
+      },
+      "maxItems": 15
+    },
+    "hiring_signals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "source"
+        ],
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "seniority": {
+            "type": "string"
+          },
+          "posted_at": {
+            "type": "string"
+          },
+          "is_infrastructure": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "days_open": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "requirements": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "source": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      },
+      "maxItems": 12
+    },
+    "pain_signals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "signal_type",
+          "signal",
+          "source",
+          "confidence"
+        ],
+        "properties": {
+          "signal_type": {
+            "type": "string",
+            "enum": [
+              "hiring_devops",
+              "hiring_engineering_growth",
+              "kubernetes_adoption",
+              "cloud_migration",
+              "infrastructure_scaling",
+              "reliability_problem",
+              "cloud_cost_problem",
+              "leadership_change",
+              "funding",
+              "technology_announcement",
+              "infra_ownership_gap",
+              "hiring_without_infra",
+              "hiring_manual_ops",
+              "manual_process",
+              "tool_sprawl",
+              "volume_growth",
+              "hiring_automation",
+              "other"
+            ]
+          },
+          "signal": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source": {
+            "type": "string",
+            "format": "uri"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "A fraction from 0.0 to 1.0, e.g. 0.7. Never a percentage."
+          }
+        }
+      },
+      "maxItems": 10
+    },
+    "reasonable_inferences": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "inference",
+          "based_on"
+        ],
+        "properties": {
+          "inference": {
+            "type": "string"
+          },
+          "based_on": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "A fraction from 0.0 to 1.0, e.g. 0.7. Never a percentage."
+          }
+        }
+      },
+      "maxItems": 8
+    },
+    "unknown": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 10
+    },
+    "decision_maker_reason": {
+      "type": "string"
+    },
+    "recommended_service": {
+      "type": "string",
+      "enum": [
+        "infrastructure_audit",
+        "devops_improvement_sprint",
+        "fractional_devops_sre",
+        "process_audit",
+        "none"
+      ]
+    },
+    "why_now": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "A fraction from 0.0 to 1.0, e.g. 0.7. Never a percentage."
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uri"
+      },
+      "maxItems": 15
+    }
+  }
+}

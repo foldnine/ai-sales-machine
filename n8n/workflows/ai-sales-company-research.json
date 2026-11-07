@@ -1,0 +1,1147 @@
+{
+  "id": "wf02CompanyResearch",
+  "name": "AI Sales — WF-02 Company Research",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "n2-trigger",
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/prompts/research.md",
+        "options": {}
+      },
+      "id": "n2-readprompt",
+      "name": "Read Research Prompt",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        300
+      ],
+      "notes": "./prompts is mounted read-only at /prompts. prompts/research.md is the single source of truth for this prompt."
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {
+          "encoding": "utf8"
+        }
+      },
+      "id": "n2-prompttext",
+      "name": "Prompt To Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/agents/research/schema.json",
+        "options": {}
+      },
+      "id": "n2-readschema",
+      "name": "Read Research Schema",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        460
+      ],
+      "notes": "./agents is mounted read-only at /agents. agents/research/schema.json is the one definition of the output contract: it constrains the model and drives validation."
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {
+          "encoding": "utf8"
+        }
+      },
+      "id": "n2-schematext",
+      "name": "Schema To Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim a batch of unresearched companies, subject to the per-domain fetch\n-- rate limit. FOR UPDATE SKIP LOCKED means two overlapping runs take different\n-- rows instead of fighting over the same ones, which is the pattern\n-- n8n/README.md mandates for every queue read.\n--\n-- The rate limit is applied at claim time rather than at fetch time, and it is\n-- the reason the pool is read wider than the batch: a company whose domain is\n-- still cooling down is not claimed at all, so it stays at 'new' and the next\n-- pass takes it, and a company behind it in the queue gets the slot instead.\n-- Filtering after claiming would leave rows stranded at 'researching'.\n--\n-- claim_domain_fetch (0012_fetch_throttle.sql) both tests and stamps in one\n-- statement, so two concurrent runs cannot both decide a domain is free. It is\n-- volatile, so the planner evaluates it per row as the LIMIT pulls them: a\n-- domain that is never reached is never stamped.\n--\n-- prior_failures is counted from agent_runs rather than from a column on\n-- companies: the audit trail already knows how many times research failed for\n-- this company, so there is no need for a retry counter and no migration.\n--\n-- A company left at 'researching' by an execution that died - n8n restarted,\n-- the process was killed before a run was opened - was never claimed again:\n-- on 2026-09-29 three had sat there since 23-25.09 with no agent_runs row at\n-- all. WF-101 reported them and nothing put them back. They are put back here,\n-- once they have been claimed for longer than a whole batch can take (batch\n-- size times the model timeout, plus an hour for fetching) and no run of\n-- theirs is still going. Each one is recorded as a failed research run, so the\n-- three-failure rule in Close Run Error parks a site that keeps killing the\n-- workflow instead of retrying it forever.\nWITH orphaned AS (\n    SELECT c.id, c.updated_at\n    FROM companies c\n    WHERE c.status = 'researching'\n      AND c.updated_at < now() - make_interval(mins => ($1::jsonb ->> 'orphan_minutes')::int)\n      AND NOT EXISTS (\n          SELECT 1 FROM agent_runs r\n          WHERE r.company_id = c.id\n            AND r.status     = 'running'\n            AND r.started_at > now() - make_interval(mins => ($1::jsonb ->> 'orphan_minutes')::int)\n      )\n      AND NOT deploy_draining()\n    FOR UPDATE SKIP LOCKED\n),\norphan_runs AS (\n    INSERT INTO agent_runs (agent_name, company_id, input, status, error, started_at, finished_at)\n    SELECT 'research', o.id, jsonb_build_object('stage', 'orphan_sweep'), 'error',\n           'orphaned: left at researching since ' || o.updated_at || ' with no live run', o.updated_at, now()\n    FROM orphaned o\n    RETURNING company_id\n),\n-- The count does not see orphan_runs (one snapshot), so >= 2 earlier failures\n-- makes this the third, as in Close Run Error.\nrequeued AS (\n    UPDATE companies c\n    SET status = CASE WHEN (SELECT count(*) FROM agent_runs r\n                            WHERE r.company_id = c.id\n                              AND r.agent_name = 'research'\n                              AND r.status     = 'error') >= 2\n                      THEN 'ignored' ELSE 'new' END\n    FROM orphaned o\n    WHERE c.id = o.id\n      AND c.status = 'researching'\n    RETURNING c.id\n),\ncandidates AS (\n    SELECT id, domain\n    FROM companies\n    WHERE status = 'new'\n      -- A deploy is waiting to restart n8n: claim nothing (0021_deploy_drain.sql).\n      AND NOT deploy_draining()\n      -- A WF-05 night batch has the GPU for the large model (0023_night_drafting.sql).\n      AND NOT night_drafting()\n    ORDER BY created_at\n    LIMIT ($1::jsonb ->> 'candidate_pool')::int\n    FOR UPDATE SKIP LOCKED\n),\nallowed AS (\n    SELECT id\n    FROM candidates\n    WHERE claim_domain_fetch(\n              domain,\n              make_interval(mins => ($1::jsonb ->> 'domain_cooldown_minutes')::int)\n          )\n    LIMIT ($1::jsonb ->> 'batch_size')::int\n),\nclaimed AS (\n    UPDATE companies\n    SET status = 'researching'\n    WHERE id IN (SELECT id FROM allowed)\n    RETURNING id, name, domain, website, industry\n)\nSELECT c.id            AS company_id,\n       c.name,\n       c.domain::text  AS domain,\n       c.website,\n       c.industry,\n       (SELECT count(*) FROM agent_runs r\n         WHERE r.company_id = c.id\n           AND r.agent_name = 'research'\n           AND r.status = 'error')::int AS prior_failures\nFROM claimed c;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ batch_size: Number($env.RESEARCH_BATCH_SIZE || 5), candidate_pool: Number($env.RESEARCH_CANDIDATE_POOL || 25), domain_cooldown_minutes: Number($env.RESEARCH_DOMAIN_COOLDOWN_MINUTES || 60), orphan_minutes: Number($env.RESEARCH_BATCH_SIZE || 5) * Math.ceil(Number($env.RESEARCH_MODEL_TIMEOUT_MS || 900000) / 60000) + 60 } ) }}"
+        }
+      },
+      "id": "p2-01",
+      "name": "Claim Companies",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -260,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Claims only companies whose domain is outside its fetch cooldown. A throttled company stays at 'new' and waits for the next pass."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the candidate page list per company.\n//\n// THE ORDER IS LOAD-BEARING. Group Material joins the fetched pages in this\n// order and truncates the result at MAX_CHARS_TOTAL, so whatever is last is\n// what the model never sees.\n//\n// Two lists, by who the company is.\n//\n// Software companies (HN, YC, job boards) get the conventional paths below. The\n// team page comes first after the homepage because the inverted rubric turns on\n// counting people: infra_people_found = 0, read off a page listing the\n// engineers, is the strongest signal in the system. /blog is last: it is the\n// longest and the least likely to carry the decisive fact.\n//\n// Regional businesses (OpenStreetMap) get the pages their own homepage links\n// to. On 2026-09-29, 77 of 115 regional companies came out of research with no\n// automation signal at all, and the reason was the page list: /team, /careers\n// and /engineering on a Croatian parts distributor return the homepage, so the\n// model read the same page ten times and a 2015 copyright line. Sampled across\n// 28 of their sites, the pages that exist are called o-nama, o-nas, usluge,\n// kontakt.html, pogoji-poslovanja - no fixed list finds them, the homepage's\n// own links do. This node reads the homepage (after robots.txt), keeps links on\n// the same site, and picks the best one per topic, in the order below.\nconst PATHS = [\n  '',\n  '/team', '/about/team', '/people', '/about-us', '/about',\n  '/careers', '/jobs',\n  '/engineering',\n  '/blog',\n];\n// When a regional homepage yields too few links (a site rendered by\n// JavaScript), these are tried instead; Group Material drops any that turn out\n// to be the homepage again.\nconst REGIONAL_FALLBACK = ['/o-nama', '/o-nas', '/usluge', '/kontakt', '/karijera'];\nconst MAX_DISCOVERED = 8;\nconst USER_AGENT = $env.BOT_USER_AGENT || 'AiSalesMachineBot/1.0 (+https://github.com/foldnine/ai-sales-machine)';\n\n// Topics, most useful first. Matched against the link's path and its text,\n// lower-cased and without diacritics, in Serbian/Croatian/Bosnian, Slovenian,\n// Macedonian (Latin and Cyrillic) and English.\n// JavaScript's \\b is ASCII-only, so a Cyrillic word would never match it;\n// the boundary is spelled out.\nconst W = (words) => new RegExp('(?:^|[^a-z0-9\\\\u0400-\\\\u04ff])(?:' + words + ')(?=$|[^a-z0-9\\\\u0400-\\\\u04ff])');\nconst TOPICS = [\n  ['about',    W('o-?nama|o-?nas|za-?nas|ko-?smo|tko-?smo|kdo-?smo|about|company|kompanija|firma|tvrtka|podjetje|o-?firmi|o-?kompaniji|o-?podjetju|за-?нас|о-?нама')],\n  ['services', W('usluge|usluga|storitve|storitev|services?|uslugi|djelatnost|dejavnost|resenja|rjesenja|solutions|sto-?radimo|what-?we-?do|ponuda|услуги|услуге')],\n  ['ordering', W('dostava|isporuka|dostavа|nacin-?placanja|placanje|placanja|kako-?kupiti|kako-?naruciti|narucivanje|narudzb\\\\w*|uslovi|uvjeti|pogoji|reklamacij\\\\w*|shipping|delivery|payment|how-?to-?order|nakup|povprasevanje|posalji-?upit|posaljite-?upit|upit|placilni-?pogoji|nacin-?placila|dostava-?i-?placanje|испорака|достава')],\n  ['careers',  W('karijer\\\\w*|kariera|posao|poslovi|zaposlenje|zaposlitev|zaposljavanje|zaposlavamo|careers?|jobs?|otvorene-?pozicije|oglasi|prakse?|вработување|кариера|каријера')],\n  ['team',     W('tim|team|ekipa|nas-?tim|zaposleni|osoblje|ljudje|people|тим')],\n  ['clients',  W('reference|preporuke|klijenti|stranke|clients|portfolio|mnenja-?strank|projekti|partneri|partners|references')],\n  ['pricing',  W('cenovnik|cjenik|cenik|cene|cijene|cena|cijena|pricing|prices|paketi|ценовник')],\n  ['contact',  W('kontakt\\\\w*|contact|контакт')],\n];\n\nconst helpers = this.helpers;\n\nconst fold = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')\n  .replace(/đ/g, 'dj').replace(/ł/g, 'l');\n\nfunction robotsBlocksAll(text) {\n  // Only the one question this node needs answered before reading the\n  // homepage: is the whole site closed to us? Allowed URLs applies the full\n  // rules to every page afterwards.\n  let applies = false;\n  for (const raw of String(text || '').split(/\\r?\\n/)) {\n    const line = raw.replace(/#.*$/, '').trim();\n    const m = line.match(/^([a-z-]+)\\s*:\\s*(.*)$/i);\n    if (!m) continue;\n    const field = m[1].toLowerCase();\n    const value = m[2].trim();\n    if (field === 'user-agent') applies = value === '*' || value.toLowerCase().startsWith('aisalesmachinebot');\n    else if (applies && field === 'disallow' && value === '/') return true;\n  }\n  return false;\n}\n\nasync function get(url) {\n  try {\n    const body = await helpers.httpRequest({\n      method: 'GET', url, timeout: 15000, headers: { 'User-Agent': USER_AGENT },\n    });\n    return typeof body === 'string' ? body : '';\n  } catch (e) {\n    return '';\n  }\n}\n\n// No URL class in n8n's task runner (ReferenceError on 2026-09-29), so links\n// are resolved by hand: absolute, protocol-relative, root-relative, relative.\nfunction resolve(href, site) {\n  const h = href.trim();\n  if (/^(mailto|tel|javascript|data|sms|viber|whatsapp):/i.test(h)) return null;\n  let abs;\n  if (/^https?:\\/\\//i.test(h)) abs = h;\n  else if (h.startsWith('//')) abs = 'https:' + h;\n  else if (h.startsWith('/')) abs = site + h;\n  else if (/^[a-z][a-z0-9+.-]*:/i.test(h)) return null;\n  else abs = site + '/' + h.replace(/^\\.\\//, '');\n  const m = abs.match(/^(https?):\\/\\/([^/?#:]+)(?::\\d+)?([^?#]*)/i);\n  if (!m) return null;\n  return { protocol: m[1].toLowerCase(), hostname: m[2].toLowerCase(), pathname: m[3] || '/' };\n}\n\nasync function discover(site) {\n  if (robotsBlocksAll(await get(site + '/robots.txt'))) return { links: [], note: 'robots.txt closes the site' };\n  const html = await get(site + '/');\n  if (!html) return { links: [], note: 'homepage unreadable' };\n  const host = (resolve(site, site) || { hostname: '' }).hostname.replace(/^www\\./, '');\n  const seen = new Map();\n  const re = /<a\\b[^>]*?href\\s*=\\s*[\"']([^\"'#]+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;\n  let m;\n  while ((m = re.exec(html)) !== null) {\n    const u = resolve(m[1], site);\n    if (!u || u.hostname.replace(/^www\\./, '') !== host) continue;\n    const path = u.pathname.replace(/\\/+$/, '');\n    if (!path || /\\.(jpe?g|png|gif|svg|webp|pdf|docx?|xlsx?|zip|css|js|xml|ico)$/i.test(path)) continue;\n    if (/wp-(content|json|admin|login)|xmlrpc|\\/feed\\b|\\/tag\\/|\\/category\\/|\\/cart|\\/korpa|\\/kosarica|\\/account|\\/login/i.test(path)) continue;\n    const key = site + path;\n    const text = fold(m[2].replace(/<[^>]+>/g, ' ')).replace(/\\s+/g, ' ').trim().slice(0, 80);\n    let decoded = path;\n    try { decoded = decodeURIComponent(path); } catch (e) { /* malformed escape: keep it raw */ }\n    const hay = fold(decoded).replace(/[_/.]+/g, '-') + ' ' + text.replace(/\\s+/g, '-');\n    // A slug longer than a page name is an article (\"koji-su-propisani-uslovi-\n    // za-registraciju-lekarske-ordinacije\" matched \"uslovi\" on 2026-09-29).\n    const slug = path.split('/').pop();\n    if (slug.length > 45) continue;\n    if (!seen.has(key)) seen.set(key, { url: key, hay, depth: path.split('/').length, len: path.length });\n  }\n  const picked = [];\n  for (const [topic, rx] of TOPICS) {\n    const hit = [...seen.values()]\n      .filter((l) => rx.test(l.hay) && !picked.some((p) => p.url === l.url))\n      .sort((a, b) => a.depth - b.depth || a.len - b.len)[0];\n    if (hit) picked.push({ ...hit, topic });\n    if (picked.length >= MAX_DISCOVERED) break;\n  }\n  // A small site often has no page for any topic, only one page per thing it\n  // does (a car-service site: pranje-vozila, zamena-guma, poliranje-vozila). Those\n  // pages are what it sells and how, so the slots left go to the site's\n  // shortest top-level pages.\n  const rest = [...seen.values()]\n    .filter((l) => l.depth <= 2 && !picked.some((p) => p.url === l.url))\n    .sort((a, b) => a.depth - b.depth || a.len - b.len);\n  for (const l of rest) {\n    if (picked.length >= MAX_DISCOVERED) break;\n    picked.push({ ...l, topic: 'page' });\n  }\n  return { links: picked.map((p) => p.url), topics: picked.map((p) => p.topic), note: seen.size + ' links on the homepage' };\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const c = item.json;\n  // A claim that found nothing comes out of the Postgres node as one item,\n  // {success: true}. Read as a company it was https://undefined/robots.txt,\n  // and WF-03 failed every hour from 2026-09-30 to 2026-10-01.\n  if (!c.company_id || !c.domain) continue;\n  const site = typeof c.website === 'string' && /^https?:\\/\\//i.test(c.website)\n    ? c.website.replace(/\\/+$/, '')\n    : 'https://' + c.domain;\n\n  let urls = PATHS.map((p) => site + p);\n  let discovery = null;\n  if (/^OSM /.test(String(c.industry || ''))) {\n    discovery = await discover(site);\n    const found = discovery.links.filter((u) => u.replace(/\\/+$/, '') !== site);\n    urls = [site, ...found];\n    if (found.length < 3) {\n      for (const p of REGIONAL_FALLBACK) if (!urls.includes(site + p)) urls.push(site + p);\n    }\n  }\n\n  out.push({\n    json: {\n      ...c,\n      base_url: site,\n      robots_url: site + '/robots.txt',\n      candidate_urls: urls,\n      link_discovery: discovery,\n      user_agent: USER_AGENT,\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "c2-02",
+      "name": "Candidate URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -60,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.robots_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 3
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "h2-03",
+      "name": "Fetch robots.txt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        140,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "A missing robots.txt means no restrictions were published, which is allow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Apply robots.txt. docs/security.md and the WF-02 row in docs/workflows.md both\n// require it, and a research bot that ignores robots.txt is the kind of thing\n// that gets an IP blocked and a reputation with it.\n//\n// Longest-match wins between Allow and Disallow, which is what Google and the\n// RFC 9309 draft both specify. A missing or unreadable robots.txt means allow:\n// that is the documented default, not an assumption.\n\nfunction parseRobots(text, agent) {\n  const groups = [];\n  let current = null;\n  for (const rawLine of String(text).split(/\\r?\\n/)) {\n    const line = rawLine.replace(/#.*$/, '').trim();\n    if (!line) continue;\n    const idx = line.indexOf(':');\n    if (idx === -1) continue;\n    const field = line.slice(0, idx).trim().toLowerCase();\n    const value = line.slice(idx + 1).trim();\n\n    if (field === 'user-agent') {\n      if (!current || current.rules.length) {\n        current = { agents: [], rules: [] };\n        groups.push(current);\n      }\n      current.agents.push(value.toLowerCase());\n    } else if ((field === 'allow' || field === 'disallow') && current) {\n      current.rules.push({ allow: field === 'allow', path: value });\n    }\n  }\n\n  const token = agent.split('/')[0].toLowerCase();\n  const exact = groups.find((g) => g.agents.includes(token));\n  const wildcard = groups.find((g) => g.agents.includes('*'));\n  return (exact || wildcard || { rules: [] }).rules;\n}\n\nfunction isAllowed(path, rules) {\n  let best = null;\n  for (const rule of rules) {\n    // An empty Disallow means \"allow everything\" and matches nothing.\n    if (rule.path === '') continue;\n    const pattern = rule.path.replace(/\\*+$/, '');\n    if (!path.startsWith(pattern)) continue;\n    if (best === null || pattern.length > best.length) {\n      best = { length: pattern.length, allow: rule.allow };\n    }\n  }\n  return best === null ? true : best.allow;\n}\n\nconst companies = $('Candidate URLs').all();\nconst out = [];\n\nfor (let i = 0; i < $input.all().length; i++) {\n  const company = companies[i].json;\n  const res = $input.all()[i].json ?? {};\n\n  // neverError is on, so a 404 arrives as data, not as an exception. Either way\n  // an unreadable robots.txt means no restrictions were published.\n  const body = typeof res.data === 'string' ? res.data : '';\n  const rules = body ? parseRobots(body, company.user_agent) : [];\n\n  const allowed = [];\n  const blocked = [];\n  for (const url of company.candidate_urls) {\n    const path = url.slice(company.base_url.length) || '/';\n    (isAllowed(path, rules) ? allowed : blocked).push(url);\n  }\n\n  out.push({\n    json: {\n      ...company,\n      urls: allowed,\n      robots_blocked: blocked,\n      robots_rules_found: rules.length,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "c2-04",
+      "name": "Allowed URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        300
+      ],
+      "notes": "Longest-match wins between Allow and Disallow, per RFC 9309."
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "urls",
+        "include": "allOtherFields",
+        "options": {
+          "destinationFieldName": "url"
+        }
+      },
+      "id": "n2-split",
+      "name": "Split URLs",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        540,
+        300
+      ],
+      "notes": "Fan out to one item per allowed page."
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 3
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": "={{ Number($env.RESEARCH_FETCH_BATCH_SIZE || 1) }}",
+              "batchInterval": "={{ Number($env.RESEARCH_FETCH_BATCH_INTERVAL_MS || 1000) }}"
+            }
+          }
+        }
+      },
+      "id": "h2-05",
+      "name": "Fetch Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        740,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "One request at a time by default, spaced by RESEARCH_FETCH_BATCH_INTERVAL_MS. domain_fetch_log is the limit between runs; this is the limit inside one."
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per fetched page arrives here. Group them back into one item per\n// company and turn the HTML into something worth sending to a model.\n//\n// It also harvests job-board links out of the RAW html before the tags are\n// stripped. htmlToText discards the href, and the href is where the board's\n// slug lives, so this has to happen here and cannot be done downstream.\n//\n// Everything is capped. An unbounded page is an unbounded bill, and a careers\n// page with a thousand listings is not more informative than the first slice.\n\nconst ATS_LINK_PATTERNS = [\n  ['greenhouse', /(?:boards|job-boards)\\.greenhouse\\.io\\/(?:embed\\/job_board\\?for=)?([a-z0-9_-]+)/gi],\n  ['ashby',      /jobs\\.ashbyhq\\.com\\/([a-z0-9_-]+)/gi],\n  ['lever',      /jobs\\.lever\\.co\\/([a-z0-9_-]+)/gi],\n  ['workable',   /apply\\.workable\\.com\\/([a-z0-9_-]+)/gi],\n  ['recruitee',  /([a-z0-9_-]+)\\.recruitee\\.com/gi],\n  ['teamtailor', /([a-z0-9_-]+)\\.teamtailor\\.com/gi],\n  ['personio',   /([a-z0-9_-]+)\\.jobs\\.personio\\.(?:de|com)/gi],\n  ['smartrecruiters', /careers\\.smartrecruiters\\.com\\/([a-z0-9_-]+)/gi],\n];\n\n// Slugs that match a pattern but are not a company.\nconst SLUG_DENYLIST = new Set([\n  'embed', 'job_board', 'www', 'api', 'jobs', 'careers', 'boards', 'app', 'static', 'assets',\n]);\n\n// Harvest (provider, slug) pairs out of raw HTML. Runs on the un-stripped page:\n// htmlToText throws the href away, which is where the slug lives.\nfunction harvestAtsLinks(html) {\n  const found = [];\n  const text = String(html);\n  for (const [provider, re] of ATS_LINK_PATTERNS) {\n    re.lastIndex = 0;\n    let m;\n    while ((m = re.exec(text)) !== null) {\n      const slug = (m[1] || '').toLowerCase();\n      if (!slug || SLUG_DENYLIST.has(slug) || slug.length < 2) continue;\n      found.push({ provider, slug, via: 'link' });\n      if (found.length > 12) return found;\n    }\n  }\n  return found;\n}\n\n// A company's candidate boards: links seen on its own pages first, because a\n// published link beats a guess, then slugs derived from the domain.\n\nconst MAX_CHARS_PER_PAGE = 6000;\nconst MAX_CHARS_TOTAL = 24000;\n\nfunction htmlToText(html) {\n  return String(html)\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<\\/(p|div|li|h[1-6]|tr|section|article)>/gi, '\\n')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#0?39;|&apos;/gi, \"'\")\n    .replace(/[ \\t ]+/g, ' ')\n    .replace(/\\n\\s*\\n\\s*\\n+/g, '\\n\\n')\n    .trim();\n}\n\n// The HTTP Request node replaces the item json with the response, so the\n// company each page belongs to is read back from Split URLs by index. n8n keeps\n// one output item per input item here, so the indexes line up.\nconst pages = $input.all();\nconst context = $('Split URLs').all();\nconst byCompany = new Map();\n\nfor (let i = 0; i < pages.length; i++) {\n  const j = { ...context[i].json, ...(pages[i].json ?? {}) };\n  const key = j.company_id;\n  if (!key) continue;\n\n  if (!byCompany.has(key)) {\n    byCompany.set(key, {\n      company_id: j.company_id,\n      name: j.name,\n      domain: j.domain,\n      website: j.website,\n      industry: j.industry,\n      base_url: j.base_url,\n      prior_failures: j.prior_failures ?? 0,\n      robots_blocked: j.robots_blocked ?? [],\n      sources: [],\n      fetch_failures: [],\n      sections: [],\n      ats_hints: [],\n    });\n  }\n  const bucket = byCompany.get(key);\n\n  // An HTTP error or a network failure is evidence of absence, not a crash.\n  const res = pages[i].json ?? {};\n  const failed = res.error !== undefined || typeof res.data !== 'string' || res.data === '';\n  if (failed) {\n    const reason = res.error\n      ? (typeof res.error === 'string' ? res.error : (res.error.message ?? 'request failed'))\n      : 'empty response';\n    bucket.fetch_failures.push(j.url + ' (' + reason + ')');\n    continue;\n  }\n\n  const text = htmlToText(res.data);\n  if (text.length < 40) {\n    bucket.fetch_failures.push(j.url + ' (no usable text)');\n    continue;\n  }\n  // A path the site does not have often answers with the homepage (a 200, not\n  // a 404). Sent again it only spends the character budget: on 2026-09-29 a\n  // regional company's material was its homepage six times over.\n  const fingerprint = text.slice(0, 1500);\n  bucket.fingerprints = bucket.fingerprints || new Map();\n  if (bucket.fingerprints.has(fingerprint)) {\n    bucket.fetch_failures.push(j.url + ' (same page as ' + bucket.fingerprints.get(fingerprint) + ')');\n    continue;\n  }\n  bucket.fingerprints.set(fingerprint, j.url);\n\n  // Read the links off the raw markup, not off `text`.\n  for (const hint of harvestAtsLinks(res.data)) {\n    if (!bucket.ats_hints.some((h) => h.provider === hint.provider && h.slug === hint.slug)) {\n      bucket.ats_hints.push(hint);\n    }\n  }\n\n  bucket.sources.push(j.url);\n  bucket.sections.push('### SOURCE: ' + j.url + '\\n' + text.slice(0, MAX_CHARS_PER_PAGE));\n}\n\nconst out = [];\nfor (const bucket of byCompany.values()) {\n  let material = bucket.sections.join('\\n\\n');\n  let truncated = false;\n  if (material.length > MAX_CHARS_TOTAL) {\n    material = material.slice(0, MAX_CHARS_TOTAL);\n    truncated = true;\n  }\n  const { fingerprints, ...rest } = bucket;\n  out.push({\n    json: {\n      // `sections` and `ats_hints` are carried forward: Merge ATS Material\n      // rebuilds `material` once the job boards have been fetched, and it\n      // cannot do that from an already-joined string.\n      ...rest,\n      material,\n      material_chars: material.length,\n      material_truncated: truncated,\n      pages_fetched: bucket.sources.length,\n      // Playwright is not deployed. A page that needs JavaScript to render is\n      // recorded as unknown rather than silently treated as empty.\n      rendering_unavailable: bucket.sources.length === 0 && bucket.fetch_failures.length > 0,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "c2-06",
+      "name": "Group Material",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        300
+      ],
+      "notes": "Fan back in to one item per company. HTML to text, capped."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Triage is an LLM call, so it leaves its own agent_runs row. agent_name is\n-- 'classifier' because that is what this is: a cheap local filter, which is the\n-- role agents/README.md assigns to the local model.\nINSERT INTO agent_runs (agent_name, company_id, input, status, model, started_at)\nVALUES (\n    'classifier',\n    ($1::jsonb ->> 'company_id')::uuid,\n    $1::jsonb -> 'input',\n    'running',\n    $1::jsonb ->> 'model',\n    now()\n)\nRETURNING id, company_id, status;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ company_id: $json.company_id, model: $env.OLLAMA_MODEL || 'llama3.1:8b', input: { execution_id: String($execution.id), workflow_id: $workflow.id, stage: 'triage', company: $json.name, domain: $json.domain, pages_fetched: $json.pages_fetched, material_chars: $json.material_chars } } ) }}"
+        }
+      },
+      "id": "p2-07",
+      "name": "Open Triage Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1740,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the Ollama triage request. Deliberately cheap: a short prompt, a small\n// slice of the material and a tiny output budget. Triage runs for every company,\n// including the ones that go on to the expensive model, so its cost is paid\n// every time and must stay low.\n\nconst MAX_TRIAGE_CHARS = 4000;\nconst MODEL = $env.OLLAMA_MODEL || 'llama3.1:8b';\n\n// The source headers carry the candidate paths - /careers, /blog, /engineering -\n// which are exactly the keywords triage looks for. Left in, the filter answers\n// \"yes, there is an engineering section\" for any site at all, because the URL\n// said so. Triage judges the text; only the research call needs the URLs.\nfunction neutraliseSources(text) {\n  return String(text).replace(/^### SOURCE: \\S+[ \\t]*$/gm, '### PAGE');\n}\n\nconst SYSTEM = \"You are a triage filter for the lead pipeline of a consultancy that sells\\nDevOps/SRE work and business process automation.\\n\\nYou are given text fetched from one company's own website. Decide exactly one\\nthing: is there anything here worth paying a stronger model to analyse?\\n\\nAnswer true if the material mentions ANY of:\\n- engineering or technical hiring of any kind\\n- cloud, infrastructure, Kubernetes, Docker, containers, CI/CD, deployment,\\n  platform, SRE, DevOps, Terraform\\n- an engineering blog, a status page, public repositories\\n- scaling, reliability, outages, incidents, migrations, performance\\n- operations, back-office, order processing, dispatch, billing, customer\\n  support or client reporting, including hiring for any of them\\n- orders, shipments, clients or transactions at volume, or the systems used to\\n  run them (shop, ERP, CRM, helpdesk, accounting)\\n\\nAnswer false ONLY if the material is plainly a brochure site with neither\\nengineering nor operations content, or there is essentially no text to judge.\\n\\nWHEN IN DOUBT, ANSWER TRUE. Answering false permanently discards a company that\\nis never looked at again. Answering true costs a fraction of a cent. Caution in\\nthis direction is correct, not lazy.\\n\\nDo not analyse the company. Do not list its technology stack. Do not judge\\nwhether it is a good customer. Only decide whether there is evidence here.\\n\\nReturn strict JSON only.\";\n\n// Ollama 0.5+ takes a JSON Schema in `format` and constrains generation to it.\n// That fixes the shape; it does not make the judgement good, which is why this\n// model is only asked a yes/no question.\nconst SCHEMA = {\n  \"type\": \"object\",\n  \"properties\": {\n    \"worth_researching\": {\n      \"type\": \"boolean\"\n    },\n    \"evidence_seen\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      }\n    },\n    \"reason\": {\n      \"type\": \"string\"\n    }\n  },\n  \"required\": [\n    \"worth_researching\",\n    \"evidence_seen\",\n    \"reason\"\n  ]\n};\n\nconst material = $('Merge ATS Material').all();\nconst out = [];\n\nfor (let i = 0; i < $input.all().length; i++) {\n  const run = $input.all()[i].json;\n  const m = material[i].json;\n\n  out.push({\n    json: {\n      triage_run_id: run.id,\n      company_id: m.company_id,\n      name: m.name,\n      domain: m.domain,\n      pages_fetched: m.pages_fetched,\n      material_chars: m.material_chars,\n      triage_request: {\n        model: MODEL,\n        stream: false,\n        format: SCHEMA,\n        options: { temperature: 0, num_predict: 256, num_ctx: 8192 },\n        messages: [\n          { role: 'system', content: SYSTEM },\n          {\n            role: 'user',\n            content:\n              'Company: ' + m.name + '\\n' +\n              'Domain: ' + m.domain + '\\n\\n' +\n              (m.material\n                ? neutraliseSources(m.material).slice(0, MAX_TRIAGE_CHARS)\n                : '(nothing could be fetched)'),\n          },\n        ],\n      },\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "c2-08",
+      "name": "Build Triage Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1940,
+        300
+      ],
+      "notes": "Short prompt, 4000 characters of material, 256 output tokens. Triage runs for every company, so its cost is paid every time."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://ollama:11434') + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.triage_request) }}",
+        "options": {
+          "timeout": "={{ $env.TRIAGE_MODEL_TIMEOUT_MS || 180000 }}"
+        }
+      },
+      "id": "n2-triage",
+      "name": "Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2140,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Local Ollama. No credential: Ollama has no authentication and the base URL is configuration, not a secret."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read the triage verdict. This node fails open on purpose.\n//\n// If Ollama is down, slow, or returns something unusable, the company goes to\n// the expensive model anyway. The filter exists to save money, and a broken\n// filter must cost money rather than silently discard leads.\n\nconst requests = $('Build Triage Request').all();\nconst out = [];\n\nfor (let i = 0; i < $input.all().length; i++) {\n  const req = requests[i].json;\n  const res = $input.all()[i].json ?? {};\n\n  let worth = true;\n  let reason = '';\n  let evidence = [];\n  let failedOpen = false;\n\n  // Nothing was fetched, so there is nothing for any model to research. This is\n  // mechanical, not a judgement, and it is checked before the model's opinion.\n  if (req.pages_fetched === 0) {\n    worth = false;\n    reason = 'No page could be fetched from this domain';\n  } else if (res.error !== undefined) {\n    failedOpen = true;\n    reason = 'Triage unavailable (' +\n      (typeof res.error === 'string' ? res.error : (res.error && res.error.message) || 'unknown') +\n      '); passing through to the research model';\n  } else {\n    const raw = res.message && typeof res.message.content === 'string' ? res.message.content : '';\n    let parsed = null;\n    try {\n      parsed = JSON.parse(raw);\n    } catch (e) {\n      failedOpen = true;\n      reason = 'Triage returned unparseable JSON; passing through to the research model';\n    }\n    if (parsed && typeof parsed.worth_researching === 'boolean') {\n      worth = parsed.worth_researching;\n      reason = typeof parsed.reason === 'string' ? parsed.reason : '';\n      evidence = Array.isArray(parsed.evidence_seen) ? parsed.evidence_seen.filter((e) => typeof e === 'string') : [];\n    } else if (parsed) {\n      failedOpen = true;\n      reason = 'Triage gave no boolean verdict; passing through to the research model';\n    }\n  }\n\n  out.push({\n    json: {\n      ...req,\n      worth_researching: worth,\n      triage_reason: reason,\n      triage_evidence: evidence,\n      triage_failed_open: failedOpen,\n      triage_model: req.triage_request.model,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "c2-09",
+      "name": "Validate Triage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        300
+      ],
+      "notes": "Fails open. A broken filter must cost money, never silently discard leads."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the triage run and carry the verdict forward as a column, so the IF\n-- after this node reads its own input instead of reaching back across the\n-- branch for it.\nWITH closed AS (\n    UPDATE agent_runs\n    SET status      = 'success',\n        output      = $1::jsonb -> 'output',\n        error       = NULL,\n        finished_at = now()\n    WHERE id = ($1::jsonb ->> 'triage_run_id')::uuid\n    RETURNING id\n)\nSELECT (SELECT id FROM closed)                      AS triage_run_id,\n       ($1::jsonb ->> 'worth_researching')::boolean AS worth_researching,\n       $1::jsonb ->> 'company_id'                   AS company_id,\n       $1::jsonb ->> 'name'                         AS name,\n       $1::jsonb ->> 'domain'                       AS domain,\n       $1::jsonb ->> 'triage_reason'                AS triage_reason;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ triage_run_id: $json.triage_run_id, company_id: $json.company_id, name: $json.name, domain: $json.domain, worth_researching: $json.worth_researching, triage_reason: $json.triage_reason, output: { worth_researching: $json.worth_researching, reason: $json.triage_reason, evidence_seen: $json.triage_evidence, failed_open: $json.triage_failed_open, model: $json.triage_model } } ) }}"
+        }
+      },
+      "id": "p2-10",
+      "name": "Close Triage Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2540,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "t2-1",
+              "leftValue": "={{ $json.worth_researching }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n2-ifworth",
+      "name": "Worth Researching?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2740,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Triage found nothing worth paying the research model for. The company is\n-- parked rather than deleted, and the reason is on its classifier run in\n-- agent_runs. Setting status back to 'new' re-queues it.\nUPDATE companies\nSET status = 'ignored'\nWHERE id = ($1::jsonb ->> 'company_id')::uuid\n  AND status = 'researching'\nRETURNING id, name, domain::text AS domain, status;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ company_id: $json.company_id } ) }}"
+        }
+      },
+      "id": "p2-11",
+      "name": "Park Company",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2940,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Skipped by triage. Re-queue by setting status back to 'new'."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "k1",
+              "name": "company",
+              "value": "={{ $json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "k2",
+              "name": "domain",
+              "value": "={{ $json.domain }}",
+              "type": "string"
+            },
+            {
+              "id": "k3",
+              "name": "result",
+              "value": "skipped_by_triage",
+              "type": "string"
+            },
+            {
+              "id": "k4",
+              "name": "company_status",
+              "value": "={{ $json.status }}",
+              "type": "string"
+            },
+            {
+              "id": "k5",
+              "name": "reason",
+              "value": "={{ $('Close Triage Run').item.json.triage_reason }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n2-skipped",
+      "name": "Skipped",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3140,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Bracket the run: 'running' before the model call, terminal after.\n-- company_id is set here, which is what lets WF-101 and v_agent_health attribute\n-- a failure to a company later.\nINSERT INTO agent_runs (agent_name, company_id, input, status, model, started_at)\nVALUES (\n    'research',\n    ($1::jsonb ->> 'company_id')::uuid,\n    $1::jsonb -> 'input',\n    'running',\n    $1::jsonb ->> 'model',\n    now()\n)\nRETURNING id, company_id, status, started_at;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ company_id: $json.company_id, model: $env.OLLAMA_RESEARCH_MODEL || 'qwen9-64k:latest', input: { execution_id: String($execution.id), workflow_id: $workflow.id, stage: 'research', company: $json.name, domain: $json.domain, sources: $('Merge ATS Material').item.json.sources, fetch_failures: $('Merge ATS Material').item.json.fetch_failures, robots_blocked: $('Merge ATS Material').item.json.robots_blocked, material_chars: $('Merge ATS Material').item.json.material_chars, material_truncated: $('Merge ATS Material').item.json.material_truncated, ats: $('Merge ATS Material').item.json.ats, ats_attempted: $('Merge ATS Material').item.json.ats_attempted } } ) }}"
+        }
+      },
+      "id": "p2-12",
+      "name": "Open Agent Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2940,
+        140
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "execution_id is what lets WF-99 close this row if the workflow dies."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble the research request. Runs once per item: this node sits after the\n// triage branch, where item indexes no longer line up with the nodes before it,\n// so the company is reached through n8n's paired-item link rather than by index.\n//\n// Both the prompt and the schema are read from disk at runtime - ./prompts and\n// ./agents are mounted read-only - so prompts/research.md and\n// agents/research/schema.json stay the single sources of truth and cannot drift\n// from this node.\n\nconst MODEL = $env.OLLAMA_RESEARCH_MODEL || 'qwen9-64k:latest';\n// Raised from 8000 when absence_checks and the two people counts were added:\n// the schema got longer, the answers got longer with it, and two of the first\n// five real runs after the change died on finish_reason 'length'. A truncated\n// response is not a partial answer, it is unparseable JSON.\n//\n// Raised again to 20000 on 2026-09-23. Six runs in two days came back\n// finish_reason 'length' with EMPTY content while successful answers peak at\n// ~1500 tokens: the budget went on thinking, which research keeps on\n// (docs/ollama.md). The answer does not need more room; the reasoning does.\nconst MAX_TOKENS = Number($env.RESEARCH_MAX_TOKENS || 20000);\n\n// prompts/research.md keeps the system prompt in the first fenced block under\n// \"## System prompt\". Extract exactly that; a heading change must fail loudly\n// rather than quietly send the whole markdown file as a prompt.\nfunction extractSystemPrompt(markdown) {\n  const section = markdown.split(/^##\\s+System prompt\\s*$/m)[1];\n  if (!section) throw new Error('prompts/research.md: no \"## System prompt\" heading found');\n  const fence = section.match(/```[a-z]*\\n([\\s\\S]*?)\\n```/);\n  if (!fence) throw new Error('prompts/research.md: no fenced block under \"## System prompt\"');\n  const text = fence[1].trim();\n  if (text.length < 200) throw new Error('prompts/research.md: system prompt looks truncated');\n  return text;\n}\n\nconst systemPrompt = extractSystemPrompt($('Prompt To Text').first().json.data);\n\n// The draft-07 meta keys are not part of the output contract and the endpoint\n// rejects some of them.\nconst schema = JSON.parse($('Schema To Text').first().json.data);\ndelete schema.$schema;\ndelete schema.$id;\ndelete schema.title;\n\nconst run = $input.item.json;\nconst m = $('Merge ATS Material').item.json;\n\nconst userContent = [\n  'Company: ' + m.name,\n  'Domain: ' + m.domain,\n  'Industry: ' + (m.industry || 'unknown'),\n  '',\n  m.sources.length\n    ? 'The following material was fetched from the company\\'s own site. Cite these URLs.'\n    : 'No material could be fetched from this company\\'s site.',\n  '',\n  m.material || '(nothing fetched)',\n  '',\n  '---',\n  'Pages that could not be fetched: ' + (m.fetch_failures.length ? m.fetch_failures.join(', ') : 'none'),\n  'Pages disallowed by robots.txt: ' + (m.robots_blocked.length ? m.robots_blocked.join(', ') : 'none'),\n  m.material_truncated ? 'The material above was truncated at a character limit.' : '',\n  '',\n  'Return the JSON object described in the system prompt, and nothing else.',\n].join('\\n');\n\nreturn {\n  json: {\n    agent_run_id: run.id,\n    company_id: m.company_id,\n    name: m.name,\n    domain: m.domain,\n    prior_failures: m.prior_failures,\n    sources: m.sources,\n    model: MODEL,\n    // Ollama's OpenAI-compatible endpoint, not /api/chat. On this version\n    // /api/chat silently ignores `format` - a two-key schema is not enforced -\n    // while response_format with strict json_schema here is. See docs/ollama.md.\n    llm_request: {\n      model: MODEL,\n      temperature: 0.2,\n      max_tokens: MAX_TOKENS,\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user', content: userContent },\n      ],\n      response_format: {\n        type: 'json_schema',\n        json_schema: { name: 'research', strict: true, schema },\n      },\n    },\n  },\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c2-13",
+      "name": "Build Research Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3140,
+        140
+      ],
+      "notes": "Prompt and schema are both read from disk, so neither is restated here."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://ollama:11434') + '/v1/chat/completions' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": "={{ $env.RESEARCH_MODEL_TIMEOUT_MS || 900000 }}"
+        }
+      },
+      "id": "n2-llm",
+      "name": "Research Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3340,
+        140
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "Local Ollama, OpenAI-compatible endpoint. /api/chat ignores `format` on this version; response_format with strict json_schema here is enforced. Fifteen minute timeout: a 9B model on this hardware takes about three minutes per company."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate the research response against agents/research/schema.json, read from\n// disk rather than restated here, so there is one definition of the contract.\n// Never throws, never repairs. A response that does not match is an error.\n//\n// Runs once per item: downstream of the triage branch, so the request this\n// response belongs to is reached through the paired-item link, not by index.\n\nconst schema = JSON.parse($('Schema To Text').first().json.data);\nconst props = schema.properties;\nconst required = schema.required;\n\nconst req = $('Build Research Request').item.json;\nconst res = $input.item.json ?? {};\n\nconst errors = [];\nconst warnings = [];\nlet parsed = null;\nlet raw = '';\nlet usage = null;\n\nif (res.error !== undefined) {\n  const e = res.error;\n  errors.push('Research model request failed: ' +\n    (typeof e === 'string' ? e : (e && e.message) || JSON.stringify(e)));\n} else {\n  usage = res.usage ?? null;\n  const choice = Array.isArray(res.choices) ? res.choices[0] : null;\n\n  if (!choice) {\n    errors.push('Response contained no choices');\n  } else if (choice.finish_reason === 'length') {\n    // The schema alone is long; with a small context window the object is cut\n    // off mid-key and the JSON never closes.\n    errors.push('Response hit the token limit and is truncated. Use a model with a ' +\n      'larger context window (OLLAMA_RESEARCH_MODEL)');\n  } else {\n    raw = (choice.message && choice.message.content) || '';\n    if (!raw.trim()) {\n      errors.push('Model returned no text content');\n    } else {\n      try {\n        parsed = JSON.parse(raw);\n      } catch (e) {\n        errors.push('Response is not valid JSON: ' + e.message);\n      }\n    }\n  }\n}\n\nif (parsed !== null && (typeof parsed !== 'object' || Array.isArray(parsed))) {\n  errors.push('Response is valid JSON but not a JSON object');\n  parsed = null;\n}\n\nif (parsed !== null) {\n  // JSON Schema allows a union of types, and the fields that carry the\n  // absence signal need one: infra_people_found is an integer when somebody\n  // counted and null when nobody looked, and those two answers mean opposite\n  // things (docs/scoring.md). A plain `typeof value === want` compares a string\n  // against the array [\"integer\",\"null\"] and fails every well-formed response,\n  // which parks every company at 'ignored' after three retries.\n  const describe = (v) => Array.isArray(v) ? 'array' : (v === null ? 'null' : typeof v);\n  const typeOk = (value, want) => (Array.isArray(want) ? want : [want]).some((w) => {\n    if (w === 'array')   return Array.isArray(value);\n    if (w === 'null')    return value === null;\n    if (w === 'integer') return Number.isInteger(value);\n    if (w === 'object')  return value !== null && typeof value === 'object' && !Array.isArray(value);\n    return typeof value === w && !Array.isArray(value) && value !== null;\n  });\n\n  for (const key of required) {\n    if (!(key in parsed)) { errors.push('Missing required key: ' + key); continue; }\n    const want = props[key] && props[key].type;\n    const value = parsed[key];\n    if (want !== undefined && !typeOk(value, want)) {\n      const wanted = Array.isArray(want) ? want.join(' or ') : want;\n      errors.push('Key ' + key + ' must be ' + wanted + ', got ' + describe(value));\n    }\n  }\n\n  const conf = props.confidence;\n  if (typeof parsed.confidence === 'number') {\n    if (!Number.isFinite(parsed.confidence) ||\n        parsed.confidence < conf.minimum || parsed.confidence > conf.maximum) {\n      errors.push('confidence must be between ' + conf.minimum + ' and ' + conf.maximum +\n        ', got ' + parsed.confidence);\n    }\n  }\n\n  const services = props.recommended_service.enum;\n  if (typeof parsed.recommended_service === 'string' && !services.includes(parsed.recommended_service)) {\n    errors.push('recommended_service \"' + parsed.recommended_service + '\" is not in the allowed set');\n  }\n\n  // The signals table has the same CHECK constraint, so a bad value here would\n  // be a failed insert later. Reject it now.\n  const signalTypes = props.pain_signals.items.properties.signal_type.enum;\n  if (Array.isArray(parsed.pain_signals)) {\n    for (const s of parsed.pain_signals) {\n      if (!s || typeof s !== 'object') { errors.push('pain_signals entries must be objects'); break; }\n      if (!signalTypes.includes(s.signal_type)) {\n        errors.push('pain_signals.signal_type \"' + s.signal_type + '\" is not an allowed signal_type');\n      }\n    }\n  }\n}\n\nconst valid = errors.length === 0;\n\n// Only signals with real text survive: signals.signal has a non-empty CHECK.\nconst signals = valid\n  ? parsed.pain_signals\n      .filter((s) => typeof s.signal === 'string' && s.signal.trim() !== '')\n      .map((s) => ({\n        signal_type: s.signal_type,\n        signal: s.signal.trim(),\n        source: typeof s.source === 'string' ? s.source : '',\n        confidence: typeof s.confidence === 'number' ? s.confidence : 0.5,\n      }))\n  : [];\n\nif (valid && parsed.pain_signals.length !== signals.length) {\n  warnings.push('Dropped ' + (parsed.pain_signals.length - signals.length) + ' pain_signals with empty text');\n}\nif (valid && new Set(signals.map((s) => s.signal_type)).size === 1 && signals.length > 2) {\n  // Local models tend to label every signal the same way. Worth seeing in the\n  // audit trail; not worth failing a run over.\n  warnings.push('All ' + signals.length + ' pain signals share one signal_type');\n}\n\nreturn {\n  json: {\n    agent_run_id: req.agent_run_id,\n    company_id: req.company_id,\n    name: req.name,\n    domain: req.domain,\n    prior_failures: req.prior_failures,\n    valid,\n    errors,\n    warnings,\n    error_message: valid ? null : 'Research validation failed: ' + errors.join('; '),\n    analysis: valid ? parsed : null,\n    signals,\n    raw_response: raw,\n    usage,\n  },\n};\n",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c2-14",
+      "name": "Validate Research",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3540,
+        140
+      ],
+      "notes": "Drives every check off agents/research/schema.json; also catches truncation."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "v2-1",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n2-if",
+      "name": "Research Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3740,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write the research and its evidence in one statement, so a company is never\n-- left marked 'researched' with no signals because a second query failed.\n--\n-- signals has a unique index on (company_id, signal_type, md5(signal));\n-- ON CONFLICT DO NOTHING makes re-running this workflow idempotent at the\n-- database level rather than by workflow discipline.\nWITH payload AS (\n    SELECT $1::jsonb AS p\n),\nupd AS (\n    UPDATE companies c\n    SET description    = COALESCE(NULLIF(payload.p #>> '{analysis,company_summary}', ''), c.description),\n        tech_stack     = COALESCE(payload.p #> '{analysis,technology}', c.tech_stack),\n        hiring_signals = COALESCE(payload.p #> '{analysis,hiring_signals}', c.hiring_signals),\n        pain_signals   = COALESCE(payload.p #> '{analysis,pain_signals}', c.pain_signals),\n        status         = 'researched',\n        -- A regional company's segment is what research found it does, not\n        -- its map tag (0025_segment_allocation.sql).\n        segment        = segment_from_research(c.source, c.industry, c.segment,\n                                               c.name || '. ' || COALESCE(payload.p #>> '{analysis,company_summary}', ''))\n    FROM payload\n    WHERE c.id = (payload.p ->> 'company_id')::uuid\n      AND c.status = 'researching'\n    RETURNING c.id\n),\nins AS (\n    INSERT INTO signals (company_id, signal_type, signal, source_url, confidence)\n    SELECT (payload.p ->> 'company_id')::uuid,\n           s ->> 'signal_type',\n           s ->> 'signal',\n           NULLIF(s ->> 'source', ''),\n           COALESCE((s ->> 'confidence')::numeric, 0.50)\n    FROM payload, jsonb_array_elements(payload.p -> 'signals') s\n    ON CONFLICT DO NOTHING\n    RETURNING id\n)\nSELECT (SELECT count(*) FROM upd)::int AS companies_updated,\n       (SELECT count(*) FROM ins)::int AS signals_inserted,\n       $1::jsonb ->> 'company_id'      AS company_id,\n       $1::jsonb ->> 'agent_run_id'    AS agent_run_id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ company_id: $json.company_id, agent_run_id: $json.agent_run_id, analysis: $json.analysis, signals: $json.signals } ) }}"
+        }
+      },
+      "id": "p2-15",
+      "name": "Store Research",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3940,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "companies and signals in one statement."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run and record what the call cost. agent_runs.duration_ms is a\n-- generated column, so it falls out of finished_at on its own.\nUPDATE agent_runs\nSET status        = 'success',\n    output        = $1::jsonb -> 'output',\n    error         = NULL,\n    prompt_tokens = ($1::jsonb #>> '{usage,prompt_tokens}')::int,\n    output_tokens = ($1::jsonb #>> '{usage,completion_tokens}')::int,\n    finished_at   = now()\nWHERE id = ($1::jsonb ->> 'agent_run_id')::uuid\nRETURNING id, company_id, status, prompt_tokens, output_tokens, duration_ms;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ agent_run_id: $('Validate Research').item.json.agent_run_id, usage: $('Validate Research').item.json.usage, output: { validated: true, warnings: $('Validate Research').item.json.warnings, analysis: $('Validate Research').item.json.analysis, raw_response: $('Validate Research').item.json.raw_response, signals_inserted: $json.signals_inserted } } ) }}"
+        }
+      },
+      "id": "p2-16",
+      "name": "Close Run Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4140,
+        40
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "r1",
+              "name": "company",
+              "value": "={{ $('Validate Research').item.json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "r2",
+              "name": "domain",
+              "value": "={{ $('Validate Research').item.json.domain }}",
+              "type": "string"
+            },
+            {
+              "id": "r3",
+              "name": "result",
+              "value": "researched",
+              "type": "string"
+            },
+            {
+              "id": "r4",
+              "name": "agent_run_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "r5",
+              "name": "duration_ms",
+              "value": "={{ $json.duration_ms }}",
+              "type": "number"
+            },
+            {
+              "id": "r6",
+              "name": "prompt_tokens",
+              "value": "={{ $json.prompt_tokens }}",
+              "type": "number"
+            },
+            {
+              "id": "r7",
+              "name": "output_tokens",
+              "value": "={{ $json.output_tokens }}",
+              "type": "number"
+            },
+            {
+              "id": "r8",
+              "name": "sources",
+              "value": "={{ $('Validate Research').item.json.analysis.sources.join(', ') }}",
+              "type": "string"
+            },
+            {
+              "id": "r9",
+              "name": "recommended_service",
+              "value": "={{ $('Validate Research').item.json.analysis.recommended_service }}",
+              "type": "string"
+            },
+            {
+              "id": "r10",
+              "name": "confidence",
+              "value": "={{ $('Validate Research').item.json.analysis.confidence }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n2-done",
+      "name": "Researched",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4340,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the run as failed and hand the company back to the queue.\n--\n-- After three failures the company is parked at 'ignored' rather than cycling\n-- forever: a site that cannot be researched twice is unlikely to become\n-- researchable on the fourth attempt, and an infinite retry loop burns tokens.\n-- prior_failures is the count from before this run, so >= 2 means this is the\n-- third.\n--\n-- The company is only moved if it is still 'researching'. If something else\n-- already advanced it, this workflow does not drag it backwards.\nWITH closed AS (\n    UPDATE agent_runs\n    SET status      = 'error',\n        error       = COALESCE(NULLIF($1::jsonb ->> 'error', ''), 'Research failed with no message'),\n        output      = $1::jsonb -> 'output',\n        finished_at = now()\n    WHERE id = ($1::jsonb ->> 'agent_run_id')::uuid\n    RETURNING id, company_id\n),\nrequeued AS (\n    UPDATE companies c\n    SET status = CASE WHEN ($1::jsonb ->> 'prior_failures')::int >= 2 THEN 'ignored' ELSE 'new' END\n    FROM closed\n    WHERE c.id = closed.company_id\n      AND c.status = 'researching'\n    RETURNING c.id, c.status\n)\nSELECT (SELECT count(*) FROM closed)::int              AS runs_closed,\n       (SELECT status FROM requeued)                   AS company_status,\n       $1::jsonb ->> 'company_id'                      AS company_id,\n       $1::jsonb ->> 'error'                           AS error;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ agent_run_id: $json.agent_run_id, company_id: $json.company_id, prior_failures: $json.prior_failures, error: $json.error_message, output: { validated: false, errors: $json.errors, raw_response: $json.raw_response } } ) }}"
+        }
+      },
+      "id": "p2-17",
+      "name": "Close Run Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3940,
+        280
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Closes the run and returns the company to the queue, or parks it at 'ignored' after three failures."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the ATS job-board URLs to try for each company.\n//\n// docs/company-research.md: six conventional paths on the company's own domain.\n// That is where the evidence is not: measured over 38 European companies, only\n// a minority publish DevOps/SRE adverts on their own site, while the boards\n// below answer with the full advert text as public JSON and no credential.\n// Without this the hiring signal the whole product rests on is invisible.\n//\n// One item out per (company, candidate board). The fan-out mirrors Split URLs.\n\nconst ATS_LINK_PATTERNS = [\n  ['greenhouse', /(?:boards|job-boards)\\.greenhouse\\.io\\/(?:embed\\/job_board\\?for=)?([a-z0-9_-]+)/gi],\n  ['ashby',      /jobs\\.ashbyhq\\.com\\/([a-z0-9_-]+)/gi],\n  ['lever',      /jobs\\.lever\\.co\\/([a-z0-9_-]+)/gi],\n  ['workable',   /apply\\.workable\\.com\\/([a-z0-9_-]+)/gi],\n  ['recruitee',  /([a-z0-9_-]+)\\.recruitee\\.com/gi],\n  ['teamtailor', /([a-z0-9_-]+)\\.teamtailor\\.com/gi],\n  ['personio',   /([a-z0-9_-]+)\\.jobs\\.personio\\.(?:de|com)/gi],\n  ['smartrecruiters', /careers\\.smartrecruiters\\.com\\/([a-z0-9_-]+)/gi],\n];\n\n// Slugs that match a pattern but are not a company.\nconst SLUG_DENYLIST = new Set([\n  'embed', 'job_board', 'www', 'api', 'jobs', 'careers', 'boards', 'app', 'static', 'assets',\n]);\n\n// Public, unauthenticated endpoints. `content` marks whether the response\n// carries full descriptions: titles alone never mention Kubernetes.\nconst PROVIDERS = {\n  greenhouse: { url: (s) => `https://boards-api.greenhouse.io/v1/boards/${s}/jobs?content=true` },\n  ashby:      { url: (s) => `https://api.ashbyhq.com/posting-api/job-board/${s}?includeCompensation=false` },\n  lever:      { url: (s) => `https://api.lever.co/v0/postings/${s}?mode=json` },\n  workable:   { url: (s) => `https://apply.workable.com/api/v1/widget/accounts/${s}?details=true` },\n  recruitee:  { url: (s) => `https://${s}.recruitee.com/api/offers/` },\n  // Both of these return the full description in the same single request the\n  // other five need, so they cost nothing extra to support. The providers that\n  // only list titles and require a second call per advert (SmartRecruiters,\n  // Workday, Rippling, Join) are deliberately not here: the N+1 traffic needs\n  // its own rate-limiting decision first.\n  teamtailor: { url: (s) => `https://${s}.teamtailor.com/jobs.json` },\n  personio:   { url: (s) => `https://${s}.jobs.personio.de/search.json?language=en` },\n};\n\nfunction slugCandidates(domain) {\n  const d = String(domain || '').toLowerCase().trim();\n  const label = d.split('.')[0].replace(/[^a-z0-9-]/g, '');\n  // Never return empty: downstream this is a splitOut, and a company with no\n  // candidate URLs would drop out of the run entirely.\n  if (!label) {\n    const flat = d.replace(/[^a-z0-9]/g, '');\n    return flat ? [flat] : [];\n  }\n  const out = [label];\n  if (label.includes('-')) out.push(label.replace(/-/g, ''));\n  // A domain of punctuation collapses to an empty slug, which would build a\n  // URL ending in a bare slash and fetch something unrelated.\n  return [...new Set(out)].filter((x) => x.length >= 2);\n}\n\nfunction atsCandidates(domain, hints, maxPerCompany) {\n  const seen = new Set();\n  const out = [];\n  const push = (provider, slug, via) => {\n    if (!PROVIDERS[provider]) return;\n    const key = provider + ':' + slug;\n    if (seen.has(key)) return;\n    seen.add(key);\n    out.push({ provider, slug, via, url: PROVIDERS[provider].url(slug) });\n  };\n\n  // A link the company published on its own careers page is not a guess, so\n  // when there is one we stop there: firing five speculative requests at five\n  // providers on top of a known-good answer is rude and buys nothing.\n  for (const h of hints || []) push(h.provider, h.slug, 'link');\n  if (out.length) return out.slice(0, maxPerCompany);\n\n  for (const slug of slugCandidates(domain)) {\n    for (const provider of Object.keys(PROVIDERS)) push(provider, slug, 'guess');\n  }\n  return out.slice(0, maxPerCompany);\n}\n\nconst MAX_CANDIDATES = Number($env.RESEARCH_ATS_MAX_CANDIDATES || 8);\nconst out = [];\n\nfor (const item of $input.all()) {\n  const c = item.json;\n  const candidates = atsCandidates(c.domain, c.ats_hints || [], MAX_CANDIDATES);\n  for (const cand of candidates) {\n    out.push({ json: {\n      company_id: c.company_id,\n      domain: c.domain,\n      url: cand.url,\n      ats_provider: cand.provider,\n      ats_slug: cand.slug,\n      ats_via: cand.via,\n    } });\n  }\n}\n\n// An empty return would end the branch and no company would reach triage at\n// all. Every company with a domain yields candidates, so this is unreachable in\n// practice, but \"unreachable\" is how silent pipeline stalls get written.\nif (!out.length) {\n  out.push({ json: { company_id: null, url: 'https://boards-api.greenhouse.io/v1/boards/__none__/jobs', ats_noop: true } });\n}\n\nreturn out;\n"
+      },
+      "id": "ats-candidates",
+      "name": "ATS Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 3
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": "={{ Number($env.RESEARCH_FETCH_BATCH_SIZE || 1) }}",
+              "batchInterval": "={{ Number($env.RESEARCH_ATS_BATCH_INTERVAL_MS || 400) }}"
+            }
+          }
+        }
+      },
+      "id": "fetch-ats-board",
+      "name": "Fetch ATS Board",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        300
+      ],
+      "notes": "Public job-board JSON. No credential: these endpoints are unauthenticated by design. neverError is on because a guessed slug answering 404 is the expected case, not a failure.",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fold the ATS boards back into one item per company, and rebuild `material`.\n//\n// The company list is read from Group Material, not from the responses: a\n// company whose boards all 404 must still reach triage with its own pages.\n\nfunction stripHtml(s) {\n  return String(s || '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    // Block-level tags become line breaks. Ashby returns a description with no\n    // newlines at all, so collapsing every tag to a space produced one 4900\n    // character paragraph, and paragraph-level selection then had nothing to\n    // select: the whole advert was kept or dropped as a unit.\n    .replace(/<\\/(p|div|li|ul|ol|h[1-6]|tr|section|article|blockquote)>/gi, '\\n')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<li[^>]*>/gi, '\\n- ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')\n    .replace(/&quot;/gi, '\"').replace(/&#0?39;|&apos;/gi, \"'\")\n    .replace(/&#(\\d+);/g, (_, d) => String.fromCharCode(+d))\n    .replace(/[ \\t ]+/g, ' ')\n    .replace(/\\n\\s*\\n\\s*\\n+/g, '\\n\\n')\n    .trim();\n}\n\n// One shape per provider. Anything unparseable returns null so the caller can\n// record a failure rather than pretend the board was empty.\nfunction parseBoard(provider, body) {\n  let d;\n  try { d = JSON.parse(body); } catch { return null; }\n  const jobs = [];\n\n  // How long a role has been open is the difference between a disqualifier and\n  // a reason to write. A DevOps role posted three weeks ago means the budget is\n  // approved and they will fill it; the same role open past 120 days means the\n  // market is not supplying it, which is the one case where an infrastructure\n  // advert helps (docs/scoring.md, capacity gap). Every board carries the date\n  // under a different name and this parser used to discard all of them, so the\n  // 120-day band could never fire.\n  const asIso = (v) => {\n    if (v === null || v === undefined || v === '') return '';\n    if (typeof v === 'number') {\n      // Lever is epoch milliseconds; anything small enough is seconds.\n      const ms = v > 1e12 ? v : v * 1000;\n      const d2 = new Date(ms);\n      return Number.isNaN(d2.getTime()) ? '' : d2.toISOString().slice(0, 10);\n    }\n    const d2 = new Date(String(v));\n    return Number.isNaN(d2.getTime()) ? '' : d2.toISOString().slice(0, 10);\n  };\n\n  const add = (title, desc, loc, url, posted) => {\n    if (!title) return;\n    jobs.push({\n      title: String(title).trim(),\n      description: stripHtml(desc),\n      location: String(loc || '').trim(),\n      url: url || '',\n      posted_at: asIso(posted),\n    });\n  };\n  if (provider === 'greenhouse') {\n    if (!Array.isArray(d.jobs)) return null;\n    for (const j of d.jobs) add(j.title, j.content, j.location && j.location.name, j.absolute_url,\n      j.first_published || j.updated_at);\n  } else if (provider === 'ashby') {\n    if (!Array.isArray(d.jobs)) return null;\n    for (const j of d.jobs) add(j.title, j.descriptionHtml || j.descriptionPlain, j.location, j.jobUrl,\n      j.publishedAt || j.updatedAt);\n  } else if (provider === 'lever') {\n    if (!Array.isArray(d)) return null;\n    for (const j of d) add(j.text, j.descriptionPlain || j.description,\n      j.categories && j.categories.location, j.hostedUrl, j.createdAt);\n  } else if (provider === 'workable') {\n    if (!Array.isArray(d.jobs)) return null;\n    for (const j of d.jobs) add(j.title, j.description, j.location && j.location.city, j.url,\n      j.published_on || j.created_at);\n  } else if (provider === 'recruitee') {\n    if (!Array.isArray(d.offers)) return null;\n    for (const j of d.offers) add(j.title, j.description, j.city, j.careers_url,\n      j.published_at || j.created_at);\n  } else if (provider === 'teamtailor') {\n    if (!Array.isArray(d.items)) return null;\n    for (const j of d.items) add(j.title, j.content_html, '', j.url, j.created_at || j.updated_at);\n  } else if (provider === 'personio') {\n    // The root is a bare array here, not an object with a jobs key.\n    if (!Array.isArray(d)) return null;\n    for (const j of d) add(j.name, j.description, j.office, j.id, j.createdAt);\n  } else {\n    return null;\n  }\n  return jobs;\n}\n\nconst TERM_WEIGHTS = [\n  // Unambiguous: you do not write these unless you operate infrastructure.\n  ['kubernetes', 6], ['k8s', 6], ['terraform', 6], ['site reliability', 6],\n  ['infrastructure as code', 6], ['argocd', 6], ['argo cd', 6], ['service mesh', 6],\n  ['istio', 5], ['linkerd', 5], ['helm', 5], ['pulumi', 5], ['ansible', 4],\n  ['prometheus', 4], ['grafana', 4], ['observability', 4], ['devops', 4],\n  // Suggestive, but common in ordinary engineering ads.\n  ['microservice', 2], ['ci/cd', 2], ['cicd', 2], ['datadog', 2], ['autoscal', 2],\n  ['incident response', 2], ['on-call', 2], ['oncall', 2], ['slo', 2],\n  // Weak on their own: present in a great many unrelated adverts.\n  ['docker', 1], ['container', 1], ['gcp', 1], ['azure', 1], ['aws', 1], ['sla', 0],\n];\n\n// A title that names the role is the strongest signal there is, but it has to\n// be the role and not a word inside another one: \"Credit Platform\" is not a\n// platform engineering job, and bare \"cloud\" or \"platform\" match far too much.\nconst TITLE_ROLE = new RegExp(\n  '\\\\b(' + [\n    'devops', 'sre', 'site reliability', 'platform engineer', 'platform engineering',\n    'infrastructure engineer', 'infrastructure architect', 'cloud engineer',\n    'cloud architect', 'cloud infrastructure', 'kubernetes', 'systems engineer',\n    'production engineer', 'reliability engineer', 'observability',\n  ].join('|') + ')\\\\b', 'i');\n\nfunction infraScore(job) {\n  const hay = (job.title + ' \\n ' + job.description).toLowerCase();\n  let score = 0;\n  const hits = [];\n  for (const [term, weight] of TERM_WEIGHTS) {\n    const n = hay.split(term).length - 1;\n    if (n > 0 && weight > 0) {\n      // Repeats count, but with diminishing returns: one advert repeating\n      // \"AWS\" nine times is not nine times the evidence.\n      score += weight * Math.min(n, 3);\n      hits.push(term);\n    }\n  }\n  if (TITLE_ROLE.test(job.title)) score += 30;\n  return { score, hits };\n}\n\n// A job description opens with several paragraphs about the company's mission\n// and only later says which tools the team runs. Taking the first N characters\n// therefore keeps the marketing and throws away the evidence, which is how an\n// advert demanding Kubernetes reached the model as \"About GoCardless...\".\n// So: keep the paragraphs that carry the signal, in their original order.\nfunction condenseDescription(desc, budget) {\n  let paras = String(desc).split(/\\n{1,}/).map((p) => p.trim()).filter((p) => p.length > 1);\n  // A description that arrives as a single blob still has to be divisible, or\n  // selection degrades to \"keep the opening\", which is the marketing.\n  if (paras.length <= 2) {\n    paras = String(desc)\n      .split(/(?<=[.!?])\\s+(?=[A-Z])/)\n      .map((p) => p.trim())\n      .filter((p) => p.length > 1);\n  }\n  if (!paras.length) return '';\n  const whole = paras.join('\\n');\n  if (whole.length <= budget) return whole;\n\n  const ranked = paras.map((text, i) => ({ i, text, score: infraScore({ title: '', description: text }).score }));\n  const keep = new Set();\n  let used = 0;\n  for (const p of ranked.slice().sort((a, b) => b.score - a.score || a.i - b.i)) {\n    if (p.score <= 0) break;\n    if (used + p.text.length > budget) continue;\n    keep.add(p.i);\n    used += p.text.length + 1;\n  }\n  // Nothing scored: fall back to the opening, which is better than nothing.\n  if (!keep.size) return whole.slice(0, budget);\n  // Spend any remaining room on the opening paragraph for context.\n  if (!keep.has(0) && used + paras[0].length <= budget) { keep.add(0); used += paras[0].length + 1; }\n\n  const chosen = [...keep].sort((a, b) => a - b);\n  const out = [];\n  let prev = -1;\n  for (const i of chosen) {\n    if (prev >= 0 && i > prev + 1) out.push('[...]');\n    out.push(paras[i]);\n    prev = i;\n  }\n  return out.join('\\n');\n}\n\nfunction buildAtsSection(board, opts) {\n  const o = Object.assign({\n    titlesBudget: 3000,     // enough to show the shape of the hiring\n    descBudget: 11000,      // the part that decides technology_fit\n    maxJobs: 6,\n  }, opts || {});\n\n  const scored = board.jobs\n    .map((j) => Object.assign({}, j, infraScore(j)))\n    .sort((a, b) => b.score - a.score);\n  const relevant = scored.filter((j) => j.score > 0);\n\n  const head = [\n    '### SOURCE: ' + board.url,\n    'ATS job board (' + board.provider + ', slug \"' + board.slug + '\", discovered by ' + board.via + ').',\n    'Open roles advertised: ' + board.jobs.length + '. Roles mentioning infrastructure work: ' + relevant.length + '.',\n    '',\n  ];\n\n  // Titles get a fixed budget of their own. A board with 225 roles must not be\n  // able to spend the whole block on a list of job names and leave no room for\n  // the descriptions, which is exactly what the first version did.\n  const titleLines = ['OPEN ROLES:'];\n  let titleChars = 0;\n  let listed = 0;\n  for (const j of scored) {\n    const line = '- ' + j.title + (j.location ? ' (' + j.location + ')' : '')\n      + (j.posted_at ? ' [posted ' + j.posted_at + ']' : ' [posting date not published]');\n    if (titleChars + line.length > o.titlesBudget) break;\n    titleLines.push(line);\n    titleChars += line.length + 1;\n    listed += 1;\n  }\n  if (listed < scored.length) titleLines.push('- ... and ' + (scored.length - listed) + ' more');\n\n  // Descriptions share what is left, split evenly across the roles that\n  // actually scored, best first.\n  const descLines = [];\n  let truncated = listed < scored.length;\n  if (relevant.length) {\n    const take = relevant.slice(0, o.maxJobs);\n    const perJob = Math.max(800, Math.floor(o.descBudget / take.length));\n    descLines.push('', 'FULL TEXT OF THE INFRASTRUCTURE-RELATED ROLES:');\n    for (const j of take) {\n      descLines.push('', '--- ' + j.title + (j.location ? ' (' + j.location + ')' : '')\n        + (j.posted_at ? ' [posted ' + j.posted_at + ']' : ' [posting date not published]') + ' ---');\n      if (j.description.length > perJob) truncated = true;\n      descLines.push(condenseDescription(j.description, perJob));\n    }\n    if (relevant.length > take.length) {\n      descLines.push('', '(' + (relevant.length - take.length) + ' further infrastructure-related roles not shown)');\n    }\n  }\n\n  const text = head.concat(titleLines, descLines).join('\\n');\n  return {\n    text, truncated,\n    total_jobs: board.jobs.length,\n    relevant_jobs: relevant.length,\n    top_score: scored.length ? scored[0].score : 0,\n    top_title: scored.length ? scored[0].title : '',\n  };\n}\n\nconst MAX_CHARS_TOTAL = Number($env.RESEARCH_MATERIAL_MAX_CHARS || 32000);\nconst ATS_BUDGET = Number($env.RESEARCH_ATS_MAX_CHARS || 14000);\n\nconst companies = $('Group Material').all();\nconst candidates = $('ATS Candidates').all();\nconst responses = $input.all();\n\n// company_id -> every board that parsed\nconst boards = new Map();\nconst attempts = new Map();\n\nfor (let i = 0; i < responses.length; i++) {\n  const cand = (candidates[i] && candidates[i].json) || {};\n  if (!cand.company_id) continue;\n  const res = (responses[i] && responses[i].json) || {};\n\n  attempts.set(cand.company_id, (attempts.get(cand.company_id) || 0) + 1);\n\n  const body = typeof res.data === 'string' ? res.data : '';\n  if (!body) continue;\n  const jobs = parseBoard(cand.ats_provider, body);\n  // A 404 body parses to null. That is the normal answer for a guessed slug\n  // and is not worth recording as a failure.\n  if (!jobs || !jobs.length) continue;\n\n  if (!boards.has(cand.company_id)) boards.set(cand.company_id, []);\n  boards.get(cand.company_id).push({\n    provider: cand.ats_provider, slug: cand.ats_slug, via: cand.ats_via,\n    url: cand.url, jobs,\n  });\n}\n\nconst out = [];\nfor (const item of companies) {\n  const c = { ...item.json };\n  const found = boards.get(c.company_id) || [];\n\n  // A board the company linked to beats one whose slug we guessed; between two\n  // of the same kind, the one advertising more roles.\n  found.sort((a, b) => (a.via === b.via ? b.jobs.length - a.jobs.length : (a.via === 'link' ? -1 : 1)));\n\n  const sections = Array.isArray(c.sections) ? c.sections.slice() : [];\n  const sources = Array.isArray(c.sources) ? c.sources.slice() : [];\n  let ats = null;\n\n  if (found.length) {\n    const best = found[0];\n    const built = buildAtsSection(best, { descBudget: Math.max(2000, ATS_BUDGET - 3000), titlesBudget: 3000 });\n    // The ATS block goes first. If anything has to be cut it must be the\n    // marketing copy on the home page, never the adverts.\n    sections.unshift(built.text);\n    sources.unshift(best.url);\n    ats = {\n      provider: best.provider, slug: best.slug, via: best.via, url: best.url,\n      total_jobs: built.total_jobs, relevant_jobs: built.relevant_jobs,\n      top_score: built.top_score, top_title: built.top_title,\n      boards_found: found.length,\n    };\n  }\n\n  let material = sections.join('\\n\\n');\n  let truncated = false;\n  if (material.length > MAX_CHARS_TOTAL) {\n    material = material.slice(0, MAX_CHARS_TOTAL);\n    truncated = true;\n  }\n\n  const { sections: _drop, ats_hints: _drop2, ...rest } = c;\n  out.push({ json: {\n    ...rest,\n    material,\n    material_chars: material.length,\n    material_truncated: truncated,\n    sources,\n    pages_fetched: sources.length,\n    ats,\n    ats_attempted: attempts.get(c.company_id) || 0,\n    rendering_unavailable: sources.length === 0 && (c.fetch_failures || []).length > 0,\n  } });\n}\n\nreturn out;\n"
+      },
+      "id": "merge-ats-material",
+      "name": "Merge ATS Material",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Read Research Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Research Prompt": {
+      "main": [
+        [
+          {
+            "node": "Prompt To Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt To Text": {
+      "main": [
+        [
+          {
+            "node": "Read Research Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Research Schema": {
+      "main": [
+        [
+          {
+            "node": "Schema To Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schema To Text": {
+      "main": [
+        [
+          {
+            "node": "Claim Companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Companies": {
+      "main": [
+        [
+          {
+            "node": "Candidate URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Candidate URLs": {
+      "main": [
+        [
+          {
+            "node": "Fetch robots.txt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch robots.txt": {
+      "main": [
+        [
+          {
+            "node": "Allowed URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed URLs": {
+      "main": [
+        [
+          {
+            "node": "Split URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split URLs": {
+      "main": [
+        [
+          {
+            "node": "Fetch Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Page": {
+      "main": [
+        [
+          {
+            "node": "Group Material",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group Material": {
+      "main": [
+        [
+          {
+            "node": "ATS Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Triage Run": {
+      "main": [
+        [
+          {
+            "node": "Build Triage Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Triage Request": {
+      "main": [
+        [
+          {
+            "node": "Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage": {
+      "main": [
+        [
+          {
+            "node": "Validate Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Triage": {
+      "main": [
+        [
+          {
+            "node": "Close Triage Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close Triage Run": {
+      "main": [
+        [
+          {
+            "node": "Worth Researching?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Worth Researching?": {
+      "main": [
+        [
+          {
+            "node": "Open Agent Run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Park Company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Park Company": {
+      "main": [
+        [
+          {
+            "node": "Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Agent Run": {
+      "main": [
+        [
+          {
+            "node": "Build Research Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Research Request": {
+      "main": [
+        [
+          {
+            "node": "Research Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Research Agent": {
+      "main": [
+        [
+          {
+            "node": "Validate Research",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Research": {
+      "main": [
+        [
+          {
+            "node": "Research Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Research Valid?": {
+      "main": [
+        [
+          {
+            "node": "Store Research",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Close Run Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Research": {
+      "main": [
+        [
+          {
+            "node": "Close Run Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close Run Success": {
+      "main": [
+        [
+          {
+            "node": "Researched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ATS Candidates": {
+      "main": [
+        [
+          {
+            "node": "Fetch ATS Board",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch ATS Board": {
+      "main": [
+        [
+          {
+            "node": "Merge ATS Material",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge ATS Material": {
+      "main": [
+        [
+          {
+            "node": "Open Triage Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "wf99ErrorHandler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

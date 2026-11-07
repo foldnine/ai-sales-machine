@@ -1,0 +1,832 @@
+{
+  "id": "wf08InboxClassifier",
+  "name": "AI Sales — WF-08 Inbox Classifier",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "nothing",
+        "format": "simple",
+        "options": {
+          "forceReconnect": "={{ Number($env.INBOX_RECONNECT_MINUTES || 5) }}",
+          "trackLastMessageId": true,
+          "customEmailConfig": "[\"ALL\"]"
+        }
+      },
+      "id": "n8-trigger",
+      "name": "Email Received",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.1,
+      "position": [
+        -1500,
+        300
+      ],
+      "credentials": {
+        "imap": {
+          "id": "imapInbound",
+          "name": "IMAP account"
+        }
+      },
+      "notes": "IMAP IDLE, an outbound connection - no webhook, so nothing has to be reachable. forceReconnect is the floor on latency: IDLE fires when mail ARRIVES, not when a flag changes or when the connection was down, and a reconnect re-runs the UNSEEN search. trackLastMessageId is OFF: the fetch marks a message read BEFORE the uid filter drops it, so a message below the stored uid is marked processed and never processed. UNSEEN alone is the right selector here, because this workflow is what marks mail read."
+    },
+    {
+      "parameters": {
+        "fileSelector": "/prompts/classifier.md",
+        "options": {}
+      },
+      "id": "f8-01",
+      "name": "Read Classifier Prompt",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        -1280,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {
+          "encoding": "utf8"
+        }
+      },
+      "id": "f8-02",
+      "name": "Prompt To Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -1080,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/agents/classifier/schema.json",
+        "options": {}
+      },
+      "id": "f8-03",
+      "name": "Read Classifier Schema",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {
+          "encoding": "utf8"
+        }
+      },
+      "id": "f8-04",
+      "name": "Schema To Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten one inbound email into the fields everything downstream needs.\n//\n// The IMAP node's \"simple\" format puts the headers it does not promote to the\n// top level into `metadata`, lower-cased. Message-ID, In-Reply-To and\n// References live there, and they are how a reply finds its thread.\n\n// Not $input: this node sits after the prompt and schema reads, so its input\n// is the schema file. The email is the trigger's output and has to be named.\n//\n// Every email, not the first: one IMAP delivery can carry several, and they\n// are all marked read on fetch. Reading only .first() dropped the rest, so a\n// reply or a \"stop\" that arrived with another mail was never seen (audit,\n// 2026-09-29). The nodes after this run once per item.\nreturn $('Email Received').all().map((item) => {\nconst e = item.json;\nconst meta = e.metadata || {};\nconst h = (name) => (meta[name] ?? meta[name.toLowerCase()] ?? '').toString().trim();\n\nconst fromRaw = (e.from || '').toString();\nconst angle = fromRaw.match(/<([^>]+)>/);\nconst fromEmail = (angle ? angle[1] : fromRaw).trim().toLowerCase();\n\n// Thread keys, newest reference last. A reply carries In-Reply-To; a reply to a\n// reply carries the whole chain in References, and our Message-ID may be\n// anywhere in it.\nconst refs = h('references').split(/\\s+/).filter(Boolean);\nconst inReplyTo = h('in-reply-to');\nconst threadKeys = [...new Set([inReplyTo, ...refs].filter(Boolean))];\n\n// Auto-replies are filtered before any model sees them. These headers are what\n// well-behaved autoresponders set; docs/workflows.md asks for the filter and\n// the classifier prompt would otherwise spend a call to answer OUT_OF_SCOPE.\nconst autoSubmitted = h('auto-submitted').toLowerCase();\nconst precedence = h('precedence').toLowerCase();\nconst isAutoReply =\n  (autoSubmitted !== '' && autoSubmitted !== 'no') ||\n  ['bulk', 'list', 'junk'].includes(precedence) ||\n  h('x-autoreply') !== '' ||\n  h('x-autorespond') !== '' ||\n  h('x-auto-response-suppress') !== '' ||\n  /^(auto(matic)?[- ]?reply|out of office|automatische)/i.test((e.subject || '').toString());\n\n// A bounce is not a reply either, and it names a different sender than the\n// person we wrote to.\nconst isBounce =\n  /^(mailer-daemon|postmaster)@/i.test(fromEmail) ||\n  h('x-failed-recipients') !== '' ||\n  /^(undeliverable|delivery status notification|returned mail|mail delivery failed)/i\n    .test((e.subject || '').toString());\n\nconst body = ((e.textPlain || '') || (e.textHtml || '').replace(/<[^>]+>/g, ' '))\n  .replace(/\\r\\n/g, '\\n')\n  .trim();\n\n// Who bounced. The DSN comes from the mailer daemon, so the sender says\n// nothing; the failed address is in X-Failed-Recipients or in the report's\n// Final-Recipient / Original-Recipient lines, or in Gmail's own wording. A 4.x.x\n// status is a temporary failure and does not suppress; anything else does.\nconst bouncedEmails = !isBounce ? [] : [...new Set([\n  ...h('x-failed-recipients').split(/[,\\s]+/),\n  ...[...body.matchAll(/(?:final|original)-recipient:\\s*rfc822;\\s*<?([^\\s>]+@[^\\s>]+)>?/gi)].map((m) => m[1]),\n  ...[...body.matchAll(/(?:wasn't|was not|couldn't be|could not be) delivered to\\s+<?([^\\s>]+@[^\\s>,]+?)>?[\\s,.]/gi)].map((m) => m[1]),\n].map((a) => String(a || '').trim().toLowerCase()).filter((a) => /^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$/.test(a)))];\nconst dsnStatus = (body.match(/^status:\\s*([245]\\.\\d{1,3}\\.\\d{1,3})/im) || [])[1] || null;\n\nreturn {\n  json: {\n    external_message_id: h('message-id'),\n    from_email: fromEmail,\n    subject: (e.subject || '').toString().slice(0, 500),\n    body: body.slice(0, 20000),\n    thread_keys: threadKeys,\n    is_auto_reply: isAutoReply,\n    is_bounce: isBounce,\n    bounced_emails: bouncedEmails,\n    bounce_hard: isBounce && !(dsnStatus && dsnStatus.startsWith('4.')),\n    dsn_status: dsnStatus,\n    received_at: (e.date || '').toString(),\n  },\n  pairedItem: { item: 0 },\n};\n});"
+      },
+      "id": "c8-05",
+      "name": "Prepare Inbound",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Find the conversation this reply belongs to.\n--\n-- Two ways, in this order. The Message-ID we recorded when WF-06 sent is the\n-- reliable one: a reply quotes it in In-Reply-To or References. The sender\n-- address is the fallback, because a reply can arrive from a colleague the\n-- message was forwarded to, or from a different alias of the same person.\n--\n-- Matching nothing is a normal outcome. This mailbox receives newsletters and\n-- service mail too, and those must not reach a classifier or a messages row.\nWITH p AS (SELECT $1::jsonb AS j),\nkeys AS (\n    SELECT array(SELECT jsonb_array_elements_text(j -> 'thread_keys') FROM p) AS k,\n           (SELECT j ->> 'from_email' FROM p) AS from_email\n),\nby_thread AS (\n    SELECT cv.id AS conversation_id, cv.lead_id\n    FROM conversations cv, keys\n    WHERE cv.external_thread_id = ANY (keys.k)\n    LIMIT 1\n),\nby_sender AS (\n    -- Only a lead we actually wrote to. Someone who has never been contacted\n    -- writing in is not a reply to anything.\n    SELECT cv.id AS conversation_id, cv.lead_id\n    FROM conversations cv\n    JOIN leads l  ON l.id = cv.lead_id\n    JOIN people pe ON pe.id = l.person_id, keys\n    WHERE lower(pe.email) = keys.from_email\n    ORDER BY cv.last_message_at DESC NULLS LAST\n    LIMIT 1\n),\nmatched AS (\n    SELECT * FROM by_thread\n    UNION ALL\n    SELECT * FROM by_sender WHERE NOT EXISTS (SELECT 1 FROM by_thread)\n    LIMIT 1\n)\n-- Exactly one row out, always, matched or not. LEFT JOINs from `p` rather than\n-- FROM `matched`, because a node that returns nothing breaks the paired-item\n-- lineage back to Prepare Inbound and the branch that handles unmatched mail\n-- then reads empty strings for every field. Measured: the first unmatched\n-- message produced an alert whose dedup key was the md5 of \"\".\n--\n-- The inbound fields are carried back out for the same reason: downstream\n-- reads one item rather than reaching across nodes for it.\nSELECT m.conversation_id,\n       m.lead_id,\n       c.id   AS company_id,\n       c.name AS company_name,\n       pe.full_name,\n       pe.email AS lead_email,\n       (m.conversation_id IS NOT NULL) AS matched,\n       CASE WHEN m.conversation_id IS NULL THEN NULL\n            WHEN EXISTS (SELECT 1 FROM by_thread) THEN 'thread'\n            ELSE 'sender' END AS matched_by,\n       p.j ->> 'from_email'            AS from_email,\n       p.j ->> 'subject'               AS subject,\n       p.j ->> 'body'                  AS body,\n       p.j ->> 'external_message_id'   AS external_message_id,\n       (p.j ->> 'is_auto_reply')::boolean AS is_auto_reply,\n       (p.j ->> 'is_bounce')::boolean     AS is_bounce,\n       -- A message seen before (a re-activation re-reads the activation day)\n       -- must not be classified again or get a second reply draft.\n       EXISTS (SELECT 1 FROM messages x\n               WHERE x.external_message_id = NULLIF(p.j ->> 'external_message_id', '')) AS already_recorded\nFROM p\nLEFT JOIN matched m   ON true\nLEFT JOIN leads l     ON l.id = m.lead_id\nLEFT JOIN companies c ON c.id = l.company_id\nLEFT JOIN people pe   ON pe.id = l.person_id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ thread_keys: $json.thread_keys, from_email: $json.from_email, subject: $json.subject, body: $json.body, external_message_id: $json.external_message_id, is_auto_reply: $json.is_auto_reply, is_bounce: $json.is_bounce } ) }}"
+        }
+      },
+      "id": "p8-06",
+      "name": "Match Thread",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -280,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Zero rows is a normal outcome: this mailbox gets newsletters too."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "nm8-1",
+              "leftValue": "={{ $json.already_recorded }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "c3ebf015-e4d0-44d7-8510-bfa9744f049d",
+      "name": "New Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -60,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "k8-1",
+              "leftValue": "={{ $json.matched }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "k8-2",
+              "leftValue": "={{ $json.is_auto_reply }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "k8-3",
+              "leftValue": "={{ $json.is_bounce }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "i8-07",
+      "name": "Classify?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -60,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble the classification request. The prompt and the output contract are\n// read from disk so prompts/classifier.md and agents/classifier/schema.json\n// stay the only place either is defined.\n\nfunction fencedBlockUnder(markdown, heading) {\n  const section = markdown.split(new RegExp('^##\\\\s+' + heading + '\\\\s*$', 'm'))[1];\n  if (!section) throw new Error('prompts/classifier.md: no \"## ' + heading + '\" heading');\n  const fence = section.match(/```[a-z]*\\n([\\s\\S]*?)\\n```/);\n  if (!fence) throw new Error('prompts/classifier.md: no fenced block under \"## ' + heading + '\"');\n  return fence[1].trim();\n}\n\nconst doc = $('Prompt To Text').first().json.data;\nconst systemPrompt = fencedBlockUnder(doc, 'System prompt');\n\n// The categories table and the UNSUBSCRIBE rules are instruction, not prose:\n// the precedence list in the system prompt is useless without the definitions.\nconst catStart = doc.indexOf('## Categories');\nconst exStart = doc.indexOf('## Examples');\nif (catStart === -1 || exStart === -1) {\n  throw new Error('prompts/classifier.md: could not locate Categories or Examples');\n}\nconst guidance = doc.slice(catStart, exStart).trim();\n\nconst schema = JSON.parse($('Schema To Text').first().json.data);\ndelete schema.$schema; delete schema.$id; delete schema.title;\n\nconst inbound = $('Prepare Inbound').item.json;\nconst thread = $('Match Thread').item.json;\n\nconst brief = [\n  'The consultant wrote to ' + (thread.full_name || 'someone') +\n    ' at ' + (thread.company_name || 'a company') + '.',\n  '',\n  'REPLY FROM: ' + inbound.from_email,\n  'SUBJECT: ' + inbound.subject,\n  '',\n  'BODY:',\n  inbound.body,\n].join('\\n');\n\nreturn {\n  json: {\n    model: $env.OLLAMA_CLASSIFIER_MODEL || $env.OLLAMA_MODEL || 'llama3.1:8b',\n    messages: [\n      { role: 'system', content: systemPrompt + '\\n\\n' + guidance },\n      { role: 'user', content: brief },\n    ],\n    format: schema,\n    stream: false,\n    options: { temperature: 0 },\n  },\n};",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c8-08",
+      "name": "Build Classify Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        160,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://ollama:11434') + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ...$json, model: $env.OLLAMA_CLASSIFIER_MODEL || $env.OLLAMA_MODEL || 'llama3.1:8b' } ) }}",
+        "options": {
+          "timeout": "={{ Number($env.CLASSIFIER_MODEL_TIMEOUT_MS || 120000) }}"
+        }
+      },
+      "id": "h8-09",
+      "name": "Classify Local",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        380,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the model's answer and decide whether it is usable.\n//\n// The schema is checked here rather than trusted, and the two flags that carry\n// consequences - requested_stop and human_required - are coerced to booleans\n// rather than read loosely: a string \"false\" is true in JavaScript, and that\n// particular bug would suppress nobody or suppress everybody.\n\n// Set by the builder, not detected: a Code node cannot read its own name,\n// and $node.name throws \"Referenced node doesn't exist\".\nconst ESCALATED = false;\nconst raw = $input.item.json;\nconst content = raw?.message?.content ?? raw?.choices?.[0]?.message?.content ?? '';\n\nlet out = null;\ntry {\n  out = typeof content === 'string' ? JSON.parse(content) : content;\n} catch (err) {\n  out = null;\n}\n\nconst CATEGORIES = ['POSITIVE','QUESTION','PRICE','NOT_NOW','NEGATIVE','REFERRAL','UNSUBSCRIBE','OUT_OF_SCOPE'];\nconst asBool = (v) => v === true || v === 'true' || v === 1;\n\nconst problems = [];\nif (!out || typeof out !== 'object') problems.push('response was not JSON');\nelse {\n  if (!CATEGORIES.includes(out.category)) problems.push('category \"' + out.category + '\" is not one of the eight');\n  const c = Number(out.confidence);\n  if (!Number.isFinite(c) || c < 0 || c > 1) problems.push('confidence is not a number in 0..1');\n  if (typeof out.reason !== 'string' || out.reason.trim() === '') problems.push('reason is empty');\n}\n\n// A response we cannot read is not a licence to guess. It is treated as the\n// least confident possible answer, which routes it to a human.\nlet classification = problems.length ? {\n  category: 'OUT_OF_SCOPE',\n  confidence: 0,\n  reason: 'unusable model response: ' + problems.join('; '),\n  requested_stop: false,\n  human_required: true,\n} : {\n  category: out.category,\n  confidence: Number(out.confidence),\n  reason: String(out.reason).slice(0, 300),\n  requested_stop: asBool(out.requested_stop),\n  human_required: asBool(out.human_required),\n  mentioned_timeline: out.mentioned_timeline ? String(out.mentioned_timeline).slice(0, 120) : null,\n  referred_to: out.referred_to ? String(out.referred_to).slice(0, 200) : null,\n};\n\nconst inbound = $('Prepare Inbound').item.json;\nconst thread = $('Match Thread').item.json;\n\n// A deterministic opt-out check, in every language outreach is written in.\n// The model decides the category; this can only ever turn a reply INTO an\n// opt-out, never out of one, because missing a \"stop\" is the one mistake here\n// that cannot be undone (prompts/classifier.md). It reads only the new part of\n// the reply: the quoted original carries our own signature, which says\n// Reply \"stop\", and a positive reply quoting it must not suppress anyone.\nfunction newPart(text) {\n  const lines = String(text || '').split('\\n');\n  const out = [];\n  for (const line of lines) {\n    if (/^\\s*>/.test(line)) break;\n    if (/^\\s*(on .+wrote:|dana .+(je )?napisa|.+ je napisao:|.+ je napisala:|am .+schrieb|-{2,}\\s*original message|-{5,}|from:\\s|od:\\s|šalje:|poslato:|sent:\\s)/i.test(line)) break;\n    if (/^--\\s*$/.test(line)) break;\n    out.push(line);\n  }\n  return out.join('\\n');\n}\nconst OPT_OUT = [\n  // English\n  /\\bunsubscribe\\b/i, /\\bremove me\\b/i, /\\btake me off\\b/i, /\\bopt[ -]?out\\b/i,\n  /\\bstop (e-?mailing|contacting|writing|messaging)\\b/i, /\\b(do not|don'?t) (contact|e-?mail|write to) me\\b/i,\n  // Serbian, Croatian, Bosnian, Montenegrin (Latin)\n  /\\bodjav/i, /\\bskinite me\\b/i, /\\b(iz)?bri[sš]ite me\\b/i, /\\bobri[sš]ite me\\b/i, /\\buklonite me\\b/i,\n  /\\bne (želim|zelim) (vi[sš]e )?(da (mi )?(se javljate|pi[sš]ete|[sš]aljete)|poruke|mailove|mejlove|e-?mailove)\\b/i,\n  /\\bne (šaljite|saljite|kontaktirajte|pi[sš]ite)\\b/i, /\\bnemojte (mi )?(vi[sš]e )?(slati|pisati|se javljati)\\b/i,\n  /\\bprestanite (da )?(mi )?([sš]aljete|pi[sš]ete|se javljate)\\b/i,\n  // Serbian and Macedonian (Cyrillic)\n  /одјав/i, /скините ме/i, /избришите ме/i, /не шаљите/i, /не контактирајте/i, /немојте (ми )?(више )?(слати|писати)/i,\n  /не праќајте/i, /отстранете ме/i,\n  // Slovenian\n  /\\bne po[sš]iljajte\\b/i, /\\bodstranite me\\b/i,\n  // Anywhere: a data-protection request is an opt-out (prompts/classifier.md)\n  /\\bgdpr\\b/i,\n];\nconst BARE_STOP = /^\\s*(stop|стоп)\\s*[.!]*\\s*$/im;\nfunction optOutPhrase(text) {\n  const t = newPart(text);\n  if (BARE_STOP.test(t)) return 'stop';\n  for (const re of OPT_OUT) { const m = t.match(re); if (m) return m[0]; }\n  return null;\n}\n\nconst phrase = optOutPhrase(inbound.body);\nif (phrase && !(classification.category === 'UNSUBSCRIBE' || classification.requested_stop)) {\n  classification.reason = ('opt-out phrase \"' + phrase + '\" in the reply; the model said ' +\n    classification.category + ': ' + classification.reason).slice(0, 300);\n  classification.category = 'UNSUBSCRIBE';\n  classification.requested_stop = true;\n  classification.confidence = 1;\n}\n\nreturn {\n  json: {\n    ...inbound,\n    ...thread,\n    classification,\n    escalated: ESCALATED,\n    model: raw?.model || null,\n    problems,\n  },\n};",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c8-10",
+      "name": "Validate Local",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cf8-1",
+              "leftValue": "={{ $json.classification.confidence }}",
+              "rightValue": 0.7,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "i8-11",
+      "name": "Confident?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        820,
+        200
+      ],
+      "notes": "Below 0.7 the classifier prompt asks for a second opinion."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://ollama:11434') + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ...$json, model: $env.OLLAMA_CLASSIFIER_ESCALATION_MODEL || 'qwen3.6:27b' } ) }}",
+        "options": {
+          "timeout": "={{ Number($env.CLASSIFIER_ESCALATION_TIMEOUT_MS || 300000) }}"
+        }
+      },
+      "id": "h8-12",
+      "name": "Classify Escalated",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        820,
+        420
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the model's answer and decide whether it is usable.\n//\n// The schema is checked here rather than trusted, and the two flags that carry\n// consequences - requested_stop and human_required - are coerced to booleans\n// rather than read loosely: a string \"false\" is true in JavaScript, and that\n// particular bug would suppress nobody or suppress everybody.\n\n// Set by the builder, not detected: a Code node cannot read its own name,\n// and $node.name throws \"Referenced node doesn't exist\".\nconst ESCALATED = true;\nconst raw = $input.item.json;\nconst content = raw?.message?.content ?? raw?.choices?.[0]?.message?.content ?? '';\n\nlet out = null;\ntry {\n  out = typeof content === 'string' ? JSON.parse(content) : content;\n} catch (err) {\n  out = null;\n}\n\nconst CATEGORIES = ['POSITIVE','QUESTION','PRICE','NOT_NOW','NEGATIVE','REFERRAL','UNSUBSCRIBE','OUT_OF_SCOPE'];\nconst asBool = (v) => v === true || v === 'true' || v === 1;\n\nconst problems = [];\nif (!out || typeof out !== 'object') problems.push('response was not JSON');\nelse {\n  if (!CATEGORIES.includes(out.category)) problems.push('category \"' + out.category + '\" is not one of the eight');\n  const c = Number(out.confidence);\n  if (!Number.isFinite(c) || c < 0 || c > 1) problems.push('confidence is not a number in 0..1');\n  if (typeof out.reason !== 'string' || out.reason.trim() === '') problems.push('reason is empty');\n}\n\n// A response we cannot read is not a licence to guess. It is treated as the\n// least confident possible answer, which routes it to a human.\nlet classification = problems.length ? {\n  category: 'OUT_OF_SCOPE',\n  confidence: 0,\n  reason: 'unusable model response: ' + problems.join('; '),\n  requested_stop: false,\n  human_required: true,\n} : {\n  category: out.category,\n  confidence: Number(out.confidence),\n  reason: String(out.reason).slice(0, 300),\n  requested_stop: asBool(out.requested_stop),\n  human_required: asBool(out.human_required),\n  mentioned_timeline: out.mentioned_timeline ? String(out.mentioned_timeline).slice(0, 120) : null,\n  referred_to: out.referred_to ? String(out.referred_to).slice(0, 200) : null,\n};\n\nconst inbound = $('Prepare Inbound').item.json;\nconst thread = $('Match Thread').item.json;\n\n// A deterministic opt-out check, in every language outreach is written in.\n// The model decides the category; this can only ever turn a reply INTO an\n// opt-out, never out of one, because missing a \"stop\" is the one mistake here\n// that cannot be undone (prompts/classifier.md). It reads only the new part of\n// the reply: the quoted original carries our own signature, which says\n// Reply \"stop\", and a positive reply quoting it must not suppress anyone.\nfunction newPart(text) {\n  const lines = String(text || '').split('\\n');\n  const out = [];\n  for (const line of lines) {\n    if (/^\\s*>/.test(line)) break;\n    if (/^\\s*(on .+wrote:|dana .+(je )?napisa|.+ je napisao:|.+ je napisala:|am .+schrieb|-{2,}\\s*original message|-{5,}|from:\\s|od:\\s|šalje:|poslato:|sent:\\s)/i.test(line)) break;\n    if (/^--\\s*$/.test(line)) break;\n    out.push(line);\n  }\n  return out.join('\\n');\n}\nconst OPT_OUT = [\n  // English\n  /\\bunsubscribe\\b/i, /\\bremove me\\b/i, /\\btake me off\\b/i, /\\bopt[ -]?out\\b/i,\n  /\\bstop (e-?mailing|contacting|writing|messaging)\\b/i, /\\b(do not|don'?t) (contact|e-?mail|write to) me\\b/i,\n  // Serbian, Croatian, Bosnian, Montenegrin (Latin)\n  /\\bodjav/i, /\\bskinite me\\b/i, /\\b(iz)?bri[sš]ite me\\b/i, /\\bobri[sš]ite me\\b/i, /\\buklonite me\\b/i,\n  /\\bne (želim|zelim) (vi[sš]e )?(da (mi )?(se javljate|pi[sš]ete|[sš]aljete)|poruke|mailove|mejlove|e-?mailove)\\b/i,\n  /\\bne (šaljite|saljite|kontaktirajte|pi[sš]ite)\\b/i, /\\bnemojte (mi )?(vi[sš]e )?(slati|pisati|se javljati)\\b/i,\n  /\\bprestanite (da )?(mi )?([sš]aljete|pi[sš]ete|se javljate)\\b/i,\n  // Serbian and Macedonian (Cyrillic)\n  /одјав/i, /скините ме/i, /избришите ме/i, /не шаљите/i, /не контактирајте/i, /немојте (ми )?(више )?(слати|писати)/i,\n  /не праќајте/i, /отстранете ме/i,\n  // Slovenian\n  /\\bne po[sš]iljajte\\b/i, /\\bodstranite me\\b/i,\n  // Anywhere: a data-protection request is an opt-out (prompts/classifier.md)\n  /\\bgdpr\\b/i,\n];\nconst BARE_STOP = /^\\s*(stop|стоп)\\s*[.!]*\\s*$/im;\nfunction optOutPhrase(text) {\n  const t = newPart(text);\n  if (BARE_STOP.test(t)) return 'stop';\n  for (const re of OPT_OUT) { const m = t.match(re); if (m) return m[0]; }\n  return null;\n}\n\nconst phrase = optOutPhrase(inbound.body);\nif (phrase && !(classification.category === 'UNSUBSCRIBE' || classification.requested_stop)) {\n  classification.reason = ('opt-out phrase \"' + phrase + '\" in the reply; the model said ' +\n    classification.category + ': ' + classification.reason).slice(0, 300);\n  classification.category = 'UNSUBSCRIBE';\n  classification.requested_stop = true;\n  classification.confidence = 1;\n}\n\nreturn {\n  json: {\n    ...inbound,\n    ...thread,\n    classification,\n    escalated: ESCALATED,\n    model: raw?.model || null,\n    problems,\n  },\n};",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c8-13",
+      "name": "Validate Escalated",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record the reply and move everything it touches, in one statement.\n--\n-- Order is the point. prompts/classifier.md: on a stop request the workflow\n-- must suppress, cancel unsent outreach, close the conversation and the lead,\n-- log it, and never reply - in that order and before anything else. A stop\n-- therefore overrides the category entirely: requested_stop on a message the\n-- model filed as QUESTION still suppresses.\nWITH p AS (SELECT $1::jsonb AS j),\nc AS (\n    SELECT (j ->> 'conversation_id')::uuid           AS conversation_id,\n           (j ->> 'lead_id')::uuid                   AS lead_id,\n           NULLIF(j ->> 'external_message_id', '')   AS ext_id,\n           j ->> 'subject'                           AS subject,\n           j ->> 'body'                              AS body,\n           lower(j ->> 'from_email')                 AS from_email,\n           NULLIF(lower(j ->> 'lead_email'), '')     AS lead_email,\n           j #>> '{classification,category}'         AS category,\n           (j #>> '{classification,confidence}')::numeric      AS confidence,\n           (j #>> '{classification,requested_stop}')::boolean  AS requested_stop,\n           (j #>> '{classification,human_required}')::boolean  AS human_required,\n           j #>> '{classification,reason}'           AS reason,\n           j #>> '{classification,mentioned_timeline}' AS timeline,\n           (j ->> 'escalated')::boolean              AS escalated\n    FROM p\n),\nv AS (\n    SELECT c.*,\n           (c.category = 'UNSUBSCRIBE' OR c.requested_stop) AS is_stop,\n           (c.confidence < 0.7)                             AS low_conf\n    FROM c\n),\nmsg AS (\n    INSERT INTO messages (conversation_id, direction, author, subject, body,\n                          classification, classification_confidence,\n                          external_message_id, sent_at)\n    SELECT conversation_id, 'inbound', 'prospect', subject, body,\n           category, round(confidence, 2), ext_id, now()\n    FROM v\n    ON CONFLICT (external_message_id) WHERE external_message_id IS NOT NULL\n        DO NOTHING\n    RETURNING id\n),\n-- 1. Suppress. Before anything else, and whatever the category said.\nsup AS (\n    -- Both addresses: the one that asked to stop, and the one we wrote to.\n    -- They are usually the same. When they are not, it is because the message\n    -- was forwarded and a colleague answered \"stop\" - and suppressing only the\n    -- colleague would leave the original recipient in the follow-up queue,\n    -- which is the exact outcome the request was meant to prevent.\n    INSERT INTO suppression_list (email, reason, note)\n    SELECT addr, 'unsubscribe_request',\n           'WF-08 ' || v.category || ': ' || left(v.reason, 180)\n    FROM v\n    CROSS JOIN LATERAL (VALUES (v.from_email), (lower(v.lead_email))) AS a(addr)\n    WHERE v.is_stop AND addr IS NOT NULL AND addr <> ''\n    ON CONFLICT (email) WHERE email IS NOT NULL DO NOTHING\n    RETURNING id\n),\n-- 2. Cancel everything not yet out of the door. 'cancelled' is not one of the\n--    statuses the suppression trigger guards, so this cannot deadlock against\n--    the row just inserted above.\ncancelled AS (\n    UPDATE outreach o\n    SET status = 'cancelled',\n        rejection_reason = 'cancelled by WF-08: recipient asked to stop'\n    WHERE o.lead_id = (SELECT lead_id FROM v)\n      AND o.status IN ('draft', 'pending_approval', 'approved', 'queued')\n      AND (SELECT is_stop FROM v)\n    RETURNING o.id\n),\n-- The message that was replied to, for the record.\nreplied AS (\n    UPDATE outreach o\n    SET reply_at = now()\n    WHERE o.lead_id = (SELECT lead_id FROM v)\n      AND o.status = 'sent'\n      AND o.reply_at IS NULL\n    RETURNING o.id\n),\n-- 3. The thread and the lead.\nconv AS (\n    UPDATE conversations cv\n    SET status = CASE\n            WHEN (SELECT is_stop FROM v)                        THEN 'unsubscribed'\n            WHEN (SELECT low_conf OR human_required FROM v)     THEN 'awaiting_human'\n            WHEN (SELECT category FROM v) = 'NEGATIVE'          THEN 'closed_lost'\n            WHEN (SELECT category FROM v) = 'NOT_NOW'           THEN 'nurture'\n            WHEN (SELECT category FROM v) = 'OUT_OF_SCOPE'      THEN cv.status\n            -- POSITIVE, QUESTION, PRICE and REFERRAL all stop here: WF-09 does\n            -- not exist, so there is nothing that could answer them.\n            ELSE 'awaiting_human'\n        END,\n        escalation_reason = CASE\n            WHEN (SELECT low_conf FROM v) THEN 'classifier confidence '\n                || (SELECT round(confidence, 2) FROM v)::text\n                || ' after ' || CASE WHEN (SELECT escalated FROM v) THEN 'escalation' ELSE 'first pass' END\n            WHEN (SELECT human_required FROM v) THEN left((SELECT reason FROM v), 200)\n            ELSE cv.escalation_reason\n        END,\n        last_message_at = now()\n    WHERE cv.id = (SELECT conversation_id FROM v)\n    RETURNING cv.id, cv.status\n),\nlead AS (\n    UPDATE leads l\n    SET status = CASE\n            WHEN (SELECT is_stop FROM v)                   THEN 'suppressed'\n            -- A lead the operator has moved to a sales stage stays there: a question\n            -- from a client at the proposal stage is still a proposal, and\n            -- only he moves it on or marks it lost (0026_first_revenue.sql).\n            WHEN l.status IN ('meeting', 'audit', 'proposal', 'closed_won') THEN l.status\n            WHEN (SELECT category FROM v) = 'POSITIVE'     THEN 'opportunity'\n            WHEN (SELECT category FROM v) = 'NEGATIVE'     THEN 'closed_lost'\n            WHEN (SELECT category FROM v) = 'NOT_NOW'      THEN 'nurture'\n            WHEN (SELECT category FROM v) = 'OUT_OF_SCOPE' THEN l.status\n            ELSE 'replied'\n        END\n    WHERE l.id = (SELECT lead_id FROM v)\n    RETURNING l.id, l.status\n),\n-- 4. Tell a human, when there is something worth waking up for.\nalert AS (\n    SELECT q.notification_id\n    FROM v\n    CROSS JOIN LATERAL queue_notification(\n        CASE WHEN v.category = 'POSITIVE' AND NOT v.is_stop\n             THEN 'positive_reply' ELSE 'conversation_escalated' END,\n        'reply:' || (SELECT conversation_id FROM v)::text || ':' || COALESCE(v.ext_id, v.category),\n        CASE WHEN v.is_stop THEN 'Opt-out: ' ELSE v.category || ': ' END\n            || COALESCE((SELECT j ->> 'company_name' FROM p), 'unknown'),\n        'From: ' || v.from_email\n            || E'\\n' || 'Category: ' || v.category\n            || ' (confidence ' || round(v.confidence, 2)::text\n            || CASE WHEN v.escalated THEN ', escalated' ELSE '' END || ')'\n            || E'\\n' || 'Why: ' || left(v.reason, 200)\n            || CASE WHEN v.is_stop\n                    THEN E'\\n\\n' || 'Suppressed. Unsent messages cancelled. Do not reply.'\n                    ELSE '' END\n            || CASE WHEN v.timeline IS NOT NULL AND v.timeline <> ''\n                    THEN E'\\n' || 'Timeline: ' || v.timeline ELSE '' END\n            || E'\\n\\n' || left(v.body, 1200),\n        CASE WHEN v.category = 'POSITIVE' OR v.is_stop THEN 'immediate' ELSE 'normal' END,\n        jsonb_build_object('conversation_id', v.conversation_id, 'category', v.category,\n                           'confidence', v.confidence, 'escalated', v.escalated),\n        NULL::uuid,\n        v.lead_id,\n        interval '7 days'\n    ) q\n    -- Nothing to say about an auto-reply that was already filtered, or a\n    -- classification that changed nothing.\n    WHERE v.category <> 'OUT_OF_SCOPE' OR v.is_stop OR v.human_required\n)\nSELECT (SELECT category FROM v)                 AS category,\n       (SELECT round(confidence,2) FROM v)      AS confidence,\n       (SELECT is_stop FROM v)                  AS suppressed,\n       (SELECT count(*) FROM msg)::int          AS messages_written,\n       (SELECT count(*) FROM sup)::int          AS suppressions_added,\n       (SELECT count(*) FROM cancelled)::int    AS outreach_cancelled,\n       (SELECT status FROM conv)                AS conversation_status,\n       (SELECT status FROM lead)                AS lead_status,\n       (SELECT notification_id FROM alert)      AS notification_id,\n       -- For the reply draft (0028_reply_draft.sql).\n       (SELECT lead_id FROM v)                  AS lead_id,\n       (SELECT conversation_id FROM v)          AS conversation_id,\n       (SELECT ext_id FROM v)                   AS external_message_id,\n       (SELECT from_email FROM v)               AS from_email;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ conversation_id: $json.conversation_id, lead_id: $json.lead_id, external_message_id: $json.external_message_id, subject: $json.subject, body: $json.body, from_email: $json.from_email, lead_email: ($json.lead_email ?? ''), company_name: $json.company_name, classification: $json.classification, escalated: $json.escalated } ) }}"
+        }
+      },
+      "id": "p8-14",
+      "name": "Apply Classification",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1280,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Suppression first, whatever the category said."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Mail that will not be classified: an auto-reply, a bounce, or something that\n-- belongs to no thread we started.\n--\n-- docs/workflows.md: \"An unmatched message is stored and flagged for a human\n-- rather than discarded.\" It cannot be stored in `messages`, which requires a\n-- conversation, so the flag is a notification and the mail stays in the\n-- mailbox where a person can read it.\n--\n-- A bounce does more than get flagged: it suppresses. An address that hard\n-- bounces is not going to start working, and continuing to send to it is what\n-- damages a young domain's reputation.\nWITH p AS (SELECT $1::jsonb AS j),\nc AS (\n    SELECT lower(j ->> 'from_email')      AS from_email,\n           j ->> 'subject'                AS subject,\n           j ->> 'body'                   AS body,\n           (j ->> 'is_auto_reply')::boolean AS is_auto_reply,\n           (j ->> 'is_bounce')::boolean     AS is_bounce,\n           (j ->> 'matched')::boolean       AS matched,\n           NULLIF(j ->> 'lead_email', '')   AS lead_email,\n           COALESCE((j ->> 'bounce_hard')::boolean, true) AS bounce_hard,\n           COALESCE(j -> 'bounced_emails', '[]'::jsonb)   AS bounced_emails\n    FROM p\n),\n-- The bounced address is the one the report names, not the postmaster's who\n-- sent it. Until 2026-09-29 only a DSN that happened to carry our Message-ID\n-- suppressed anything, because the sender fallback never matches a mailer\n-- daemon. A temporary (4.x.x) failure suppresses nothing.\ntargets AS (\n    SELECT DISTINCT lower(x)::citext AS email\n    FROM c, jsonb_array_elements_text(c.bounced_emails) x\n    WHERE c.is_bounce AND c.bounce_hard\n    UNION\n    SELECT lower(lead_email)::citext FROM c\n    WHERE c.is_bounce AND c.bounce_hard AND c.lead_email IS NOT NULL\n),\nbounce_sup AS (\n    INSERT INTO suppression_list (email, reason, note)\n    SELECT t.email, 'hard_bounce', 'WF-08: ' || left((SELECT subject FROM c), 180)\n    FROM targets t\n    ON CONFLICT (email) WHERE email IS NOT NULL DO NOTHING\n    RETURNING id\n),\nbounced_people AS (\n    UPDATE people SET email_status = 'bounced'\n    WHERE email IN (SELECT email FROM targets)\n    RETURNING id\n),\nbounced_outreach AS (\n    UPDATE outreach o SET status = 'bounced'\n    FROM leads l, people pe\n    WHERE o.lead_id = l.id AND pe.id = l.person_id\n      AND pe.email IN (SELECT email FROM targets)\n      AND o.status = 'sent'\n      AND o.sent_at > now() - interval '14 days'\n    RETURNING o.id\n),\nalert AS (\n    SELECT q.notification_id\n    FROM c\n    CROSS JOIN LATERAL queue_notification(\n        'system',\n        'inbox:' || CASE WHEN c.is_bounce THEN 'bounce' WHEN c.is_auto_reply THEN 'auto' ELSE 'unmatched' END\n            || ':' || md5(c.from_email || coalesce(c.subject, '')),\n        CASE WHEN c.is_bounce     THEN 'Bounce: '\n             WHEN c.is_auto_reply THEN 'Auto-reply: '\n             ELSE 'Unmatched mail: ' END || left(coalesce(c.subject, '(no subject)'), 80),\n        'From: ' || c.from_email\n            || CASE WHEN c.is_bounce AND EXISTS (SELECT 1 FROM targets)\n                    THEN E'\\n' || 'Suppressed: ' || (SELECT string_agg(email::text, ', ') FROM targets)\n                    WHEN c.is_bounce AND NOT c.bounce_hard THEN E'\\n' || 'Temporary failure: nothing suppressed'\n                    WHEN c.is_bounce THEN E'\\n' || 'Bounced address not found in the report: check it by hand'\n                    ELSE '' END\n            || E'\\n\\n' || left(coalesce(c.body, ''), 600),\n        CASE WHEN c.is_bounce THEN 'normal' ELSE 'batched' END,\n        jsonb_build_object('from', c.from_email, 'matched', c.matched),\n        NULL::uuid, NULL::uuid, interval '1 day'\n    ) q\n    -- An auto-reply on a thread we know about is noise; one from nowhere is at\n    -- least worth a batched line.\n    WHERE NOT (c.is_auto_reply AND c.matched)\n)\nSELECT (SELECT from_email FROM c)                 AS from_email,\n       (SELECT is_bounce FROM c)                  AS bounce,\n       (SELECT is_auto_reply FROM c)              AS auto_reply,\n       (SELECT matched FROM c)                    AS matched,\n       (SELECT count(*) FROM bounce_sup)::int     AS suppressions_added,\n       (SELECT count(*) FROM bounced_outreach)::int AS outreach_bounced,\n       (SELECT notification_id FROM alert)        AS notification_id;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ from_email: $json.from_email, subject: $json.subject, body: $json.body, is_auto_reply: $json.is_auto_reply, is_bounce: $json.is_bounce, matched: ($json.matched ?? false), lead_email: ($json.lead_email ?? ''), bounce_hard: $('Prepare Inbound').item.json.bounce_hard, bounced_emails: $('Prepare Inbound').item.json.bounced_emails } ) }}"
+        }
+      },
+      "id": "p8-15",
+      "name": "Record Unhandled",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        160,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Auto-replies, bounces and mail belonging to no thread."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "r8-1",
+              "leftValue": "={{ ['POSITIVE', 'QUESTION', 'PRICE'].includes($json.category) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "r8-2",
+              "leftValue": "={{ $json.suppressed === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "r8-3",
+              "leftValue": "={{ Boolean($json.lead_id) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "i8-20",
+      "name": "Draft Reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- What the reply draft is written from: the company, what was sent, the\n-- thread so far, and what research found (prompts/reply-draft.md).\nSELECT co.name            AS company_name,\n       co.domain::text    AS domain,\n       co.country,\n       co.segment,\n       (SELECT r.output #>> '{analysis,company_summary}'\n        FROM agent_runs r\n        WHERE r.company_id = co.id AND r.agent_name = 'research' AND r.status = 'success'\n        ORDER BY r.finished_at DESC NULLS LAST LIMIT 1) AS research_summary,\n       COALESCE((SELECT json_agg(json_build_object('subject', o.subject, 'body', o.body, 'sent_at', o.sent_at)\n                                 ORDER BY o.sequence_step)\n                 FROM outreach o WHERE o.lead_id = l.id AND o.status = 'sent'), '[]'::json) AS sent,\n       COALESCE((SELECT json_agg(json_build_object('direction', m.direction, 'body', left(m.body, 3000),\n                                                   'at', COALESCE(m.sent_at, m.created_at))\n                                 ORDER BY COALESCE(m.sent_at, m.created_at))\n                 FROM messages m\n                 WHERE m.conversation_id = ($1::jsonb ->> 'conversation_id')::uuid), '[]'::json) AS thread\nFROM leads l\nJOIN companies co ON co.id = l.company_id\nWHERE l.id = ($1::jsonb ->> 'lead_id')::uuid",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ lead_id: $json.lead_id, conversation_id: $json.conversation_id }) }}"
+        }
+      },
+      "id": "p8-21",
+      "name": "Reply Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1720,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "fileSelector": "/prompts/reply-draft.md",
+        "options": {}
+      },
+      "id": "f8-22",
+      "name": "Read Reply Prompt",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1940,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "options": {
+          "encoding": "utf8"
+        }
+      },
+      "id": "f8-23",
+      "name": "Reply Prompt To Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        2160,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// The reply draft request (prompts/reply-draft.md). The draft goes to Telegram\n// for the operator to copy into their mail client; nothing here sends anything.\n\nconst doc = $json.data;\nconst section = doc.split(/^##\\s+System prompt\\s*$/m)[1];\nconst fence = section && section.match(/```[a-z]*\\n([\\s\\S]*?)\\n```/);\nif (!fence) throw new Error('prompts/reply-draft.md: no fenced block under \"## System prompt\"');\nconst systemPrompt = fence[1].trim();\n\nconst ctx = $('Reply Context').item.json;\nconst applied = $('Apply Classification').item.json;\n\nconst brief = [\n  'COMPANY: ' + ctx.company_name + ' (' + ctx.domain + '), country ' + (ctx.country || 'unknown') +\n    ', segment ' + (ctx.segment || 'none'),\n  'WHAT RESEARCH FOUND: ' + (ctx.research_summary || 'nothing recorded'),\n  '',\n  'WHAT URO\\u0160 SENT',\n  ...(ctx.sent || []).map((m) => '--- ' + String(m.sent_at).slice(0, 10) + ', subject: ' + m.subject + '\\n' + m.body),\n  '',\n  'THE THREAD SO FAR (oldest first)',\n  ...(ctx.thread || []).map((m) => '--- ' + m.direction + ', ' + String(m.at).slice(0, 16) + '\\n' + m.body),\n  '',\n  'Their latest message was classified ' + applied.category + '.',\n  'Write the reply body to their latest message.',\n].join('\\n');\n\nreturn {\n  json: {\n    model: $env.OLLAMA_REPLY_MODEL || 'qwen3.6:27b',\n    messages: [\n      { role: 'system', content: systemPrompt },\n      { role: 'user', content: brief },\n    ],\n    stream: false,\n    think: false,\n    options: { temperature: 0.3 },\n  },\n};"
+      },
+      "id": "c8-24",
+      "name": "Build Reply Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2380,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.OLLAMA_BASE_URL || 'http://ollama:11434') + '/api/chat' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": "={{ Number($env.REPLY_MODEL_TIMEOUT_MS || 900000) }}"
+        }
+      },
+      "id": "h8-25",
+      "name": "Draft Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2600,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The draft as its own Telegram message, after the classification alert. A\n-- model that failed or returned nothing queues nothing: the alert already told\n-- the operator there is a reply to answer.\nSELECT q.notification_id\nFROM (SELECT $1::jsonb AS j) p\nCROSS JOIN LATERAL queue_notification(\n    'reply_draft',\n    'reply_draft:' || (j ->> 'conversation_id') || ':' || COALESCE(j ->> 'external_message_id', ''),\n    'Predlog odgovora: ' || (j ->> 'company_name'),\n    'Odgovor na: ' || (j ->> 'from_email') || ' (' || (j ->> 'category') || ')'\n        || E'\\n' || 'Kopiraj u Gmail i odgovori u istom threadu. Ništa nije poslato.'\n        || E'\\n\\n' || (j ->> 'draft'),\n    'immediate',\n    jsonb_build_object('conversation_id', j ->> 'conversation_id', 'category', j ->> 'category'),\n    NULL::uuid,\n    (j ->> 'lead_id')::uuid,\n    interval '7 days'\n) q\nWHERE btrim(COALESCE(j ->> 'draft', '')) <> ''",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ conversation_id: $('Apply Classification').item.json.conversation_id, external_message_id: $('Apply Classification').item.json.external_message_id, from_email: $('Apply Classification').item.json.from_email, category: $('Apply Classification').item.json.category, lead_id: $('Apply Classification').item.json.lead_id, company_name: $('Reply Context').item.json.company_name, draft: String(($json.message && $json.message.content) || '').replace(/<think>[\\s\\S]*?<\\/think>/g, '').trim().slice(0, 3000) }) }}"
+        }
+      },
+      "id": "p8-26",
+      "name": "Queue Reply Draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2820,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Email Received": {
+      "main": [
+        [
+          {
+            "node": "Read Classifier Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Classifier Prompt": {
+      "main": [
+        [
+          {
+            "node": "Prompt To Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt To Text": {
+      "main": [
+        [
+          {
+            "node": "Read Classifier Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Classifier Schema": {
+      "main": [
+        [
+          {
+            "node": "Schema To Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schema To Text": {
+      "main": [
+        [
+          {
+            "node": "Prepare Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Inbound": {
+      "main": [
+        [
+          {
+            "node": "Match Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match Thread": {
+      "main": [
+        [
+          {
+            "node": "New Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify?": {
+      "main": [
+        [
+          {
+            "node": "Build Classify Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Unhandled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Classify Request": {
+      "main": [
+        [
+          {
+            "node": "Classify Local",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Local": {
+      "main": [
+        [
+          {
+            "node": "Validate Local",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Local": {
+      "main": [
+        [
+          {
+            "node": "Confident?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confident?": {
+      "main": [
+        [
+          {
+            "node": "Apply Classification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Classify Escalated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Escalated": {
+      "main": [
+        [
+          {
+            "node": "Validate Escalated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Escalated": {
+      "main": [
+        [
+          {
+            "node": "Apply Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Classification": {
+      "main": [
+        [
+          {
+            "node": "Draft Reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Reply?": {
+      "main": [
+        [
+          {
+            "node": "Reply Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Reply Context": {
+      "main": [
+        [
+          {
+            "node": "Read Reply Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Reply Prompt": {
+      "main": [
+        [
+          {
+            "node": "Reply Prompt To Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply Prompt To Text": {
+      "main": [
+        [
+          {
+            "node": "Build Reply Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reply Request": {
+      "main": [
+        [
+          {
+            "node": "Draft Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Reply": {
+      "main": [
+        [
+          {
+            "node": "Queue Reply Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Message?": {
+      "main": [
+        [
+          {
+            "node": "Classify?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "wf99ErrorHandler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "instanceId": "ai-sales-machine"
+  }
+}

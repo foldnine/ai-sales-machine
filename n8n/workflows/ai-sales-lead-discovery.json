@@ -1,0 +1,374 @@
+{
+  "id": "wf01LeadDiscovery",
+  "name": "AI Sales — WF-01 Lead Discovery",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 6,
+              "triggerAtMinute": 10
+            }
+          ]
+        }
+      },
+      "id": "n1-trigger",
+      "name": "Daily At 06:10",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -160,
+        300
+      ],
+      "notes": "Before the working day. Research runs every 30 minutes and will have worked through the batch long before anything is approved."
+    },
+    {
+      "parameters": {
+        "url": "https://yc-oss.github.io/api/companies/all.json",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "neverError": false,
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "h1-01",
+      "name": "Fetch YC Directory",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        60,
+        300
+      ],
+      "notes": "About 10MB. Read as text and parsed downstream: the body is a top-level JSON array, and letting n8n parse it produces 6000 items instead of one. neverError is off here - an empty directory is not a run worth continuing."
+    },
+    {
+      "parameters": {
+        "url": "https://hn.algolia.com/api/v1/search_by_date",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "tags",
+              "value": "story,author_whoishiring"
+            },
+            {
+              "name": "hitsPerPage",
+              "value": "10"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "h1-02",
+      "name": "Fetch HN Index",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        280,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "No API key and no rate limit worth the name. neverError: HN being down must not cost the YC half of the run."
+    },
+    {
+      "parameters": {
+        "jsCode": "// The whoishiring account posts three threads a month: \"Who is hiring?\",\n// \"Who wants to be hired?\" and \"Freelancer?\". Only the first is a list of\n// companies, and search_by_date returns whichever went up most recently, so\n// the title has to be matched rather than trusted.\nconst hits = ($('Fetch HN Index').first().json || {}).hits || [];\nconst hiring = hits.filter(h => /who is hiring/i.test(h.title || ''));\n\nif (hiring.length === 0) {\n  // Not an error worth stopping the workflow for - YC alone is a full run, and\n  // the thread reappears on the first of next month.\n  return [{ json: { story_id: null, story_title: null, skipped: 'no \"Who is hiring?\" thread found' } }];\n}\n\n// search_by_date is newest first.\nconst newest = hiring[0];\nreturn [{ json: {\n  story_id: newest.objectID,\n  story_title: newest.title,\n  story_created_at: newest.created_at\n} }];"
+      },
+      "id": "c1-03",
+      "name": "Pick HN Thread",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://hn.algolia.com/api/v1/items/{{ $json.story_id || '0' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $env.BOT_USER_AGENT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "h1-04",
+      "name": "Fetch HN Thread",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Item 0 does not exist, which is the deliberate outcome when Pick HN Thread found no thread: a 404 with neverError on, an empty children array, and a YC-only run."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn three public sources into candidate companies.\n//\n// The filters here encode one thesis, and it is the inverse of the one this\n// repository shipped with: the buyer runs production software and has nobody\n// whose job is to run it. So a company advertising for a DevOps engineer is\n// REJECTED, not scored highly - it has diagnosed the problem itself and has a\n// salary approved. See prompts/scoring.md.\n//\n// Nothing here decides whether a company is worth contacting. That is WF-02's\n// and WF-04's work, and both are better at it than a regular expression. This\n// node only decides what is worth paying a research model to look at.\n\nconst NOW_YEAR       = new Date().getUTCFullYear();\nconst MIN_TEAM       = Number($env.DISCOVERY_MIN_TEAM_SIZE || 10);\nconst MAX_TEAM       = Number($env.DISCOVERY_MAX_TEAM_SIZE || 120);\nconst MAX_BATCH_AGE  = Number($env.DISCOVERY_MAX_BATCH_AGE_YEARS || 8);\nconst DAILY_LIMIT    = Number($env.DISCOVERY_DAILY_LIMIT || 25);\n// The day's slots are shared by ICP segment in Record Candidates\n// (icp_segments.discovery_share, 0025), not by source any more.\n\n// A role that means they are hiring the solution instead of buying it.\nconst INFRA_ROLE = /\\b(devops|sre|site\\s*reliability|platform\\s+engineer|infrastructure\\s+engineer|infra\\s+engineer|cloud\\s+engineer|systems\\s+engineer|production\\s+engineer|kubernetes\\s+engineer)\\b/i;\n// Any engineering role at all. No engineering role means no infrastructure.\nconst ENG_ROLE   = /\\b(engineer|developer|swe|programmer|architect|cto)\\b/i;\n// A company selling infrastructure tooling employs infrastructure people, and\n// is a competitor besides.\nconst VENDOR     = /(devops|\\bsre\\b|observability|kubernetes|ci\\/?cd|infrastructure|platform engineering|finops|terraform|deployment|incident response|uptime|apm|log management)/i;\n// The same idea for a Hacker News listing, which has no one-line description to\n// test. It has to run against the whole post, so it is narrower: only phrases\n// that describe a company's own product, never a word that shows up in prose.\n// A post that mentions on-call or observability at all is disqualifying either\n// way - a company with an on-call rotation has the infrastructure practice this\n// system exists to supply.\nconst VENDOR_PRODUCT = /(observability|uptime monitoring|incident management|incident response|log management|on-?call|\\bapm\\b|application performance monitoring|infrastructure monitoring|ci\\/cd platform|developer platform|kubernetes platform|cloud cost|finops)/i;\n\n// Applicant tracking systems and link shorteners. A posting that only links to\n// one of these has not told us the company's domain, and inserting the ATS as\n// a company would poison the table.\nconst NOT_A_COMPANY = new Set([\n  'greenhouse.io','lever.co','ashbyhq.com','workable.com','breezy.hr','recruitee.com',\n  'bamboohr.com','bamboohr.co.uk','jobvite.com','smartrecruiters.com','myworkdayjobs.com',\n  'workday.com','trinethire.com','jazzhr.com','applytojob.com','rippling.com','paylocity.com',\n  'gethired.com','teamtailor.com','pinpointhq.com','notion.site','notion.so','docs.google.com',\n  'forms.gle','linkedin.com','github.io','github.com','angel.co','wellfound.com','ycombinator.com',\n  'bit.ly','tinyurl.com','twitter.com','x.com','youtube.com','medium.com',\n  // Shorteners hide the company behind a redirect: Flow Traders went in as\n  // lnkd.in on 2026-09-23 and stuck at 'researching'.\n  'lnkd.in','t.co','ow.ly','buff.ly','rebrand.ly','bitly.com','cutt.ly','is.gd','shorturl.at','tiny.cc'\n]);\n\n// A recruiting subdomain is not a company. careers.snowflake.com went into the\n// companies table on the first live run and would have been researched as if it\n// were a distinct company from snowflake.com.\nconst RECRUITING_SUBDOMAIN = /^(careers|jobs|apply|join|boards|hire|hiring|work|recruiting|talent)\\./;\n\nfunction toDomain(url) {\n  const m = /^https?:\\/\\/([^/\\s?#]+)/i.exec((url || '').trim());\n  if (!m) return null;\n  let d = m[1].toLowerCase().split(':')[0];\n  if (d.startsWith('www.')) d = d.slice(4);\n  if (RECRUITING_SUBDOMAIN.test(d)) d = d.replace(RECRUITING_SUBDOMAIN, '');\n  if (!/^[a-z0-9.-]+\\.[a-z]{2,}$/.test(d)) return null;\n  const parts = d.split('.');\n  const registrable = parts.slice(-2).join('.');\n  if (NOT_A_COMPANY.has(d) || NOT_A_COMPANY.has(registrable)) return null;\n  return d;\n}\n\nconst candidates = [];\nconst stats = { yc_total: 0, yc_rejected: {}, hn_total: 0, hn_rejected: {}, hn_thread: null,\n                osm_total: 0, osm_rejected: {}, osm_countries: {}, osm_failed: [], osm_origin: {} };\nconst rejectYc = (r) => { stats.yc_rejected[r] = (stats.yc_rejected[r] || 0) + 1; };\nconst rejectHn = (r) => { stats.hn_rejected[r] = (stats.hn_rejected[r] || 0) + 1; };\nconst rejectOsm = (r) => { const k = r.replace(/\\d+ locations/, 'N locations'); stats.osm_rejected[k] = (stats.osm_rejected[k] || 0) + 1; };\n\n// ---------------------------------------------------------------- Y Combinator\n// Fetched as text and parsed here: the response is a top-level JSON array, and\n// letting n8n parse it turns 6000 companies into 6000 items for no purpose.\nlet yc = [];\ntry {\n  yc = JSON.parse($('Fetch YC Directory').first().json.data || '[]');\n} catch (e) {\n  throw new Error('YC directory did not parse as JSON: ' + e.message);\n}\nstats.yc_total = yc.length;\n\nfor (const c of yc) {\n  if (c.status !== 'Active')       { rejectYc('not active'); continue; }\n  const ts = c.team_size;\n  if (!ts || ts < MIN_TEAM || ts > MAX_TEAM) { rejectYc('team size out of band'); continue; }\n  if (c.nonprofit)                 { rejectYc('nonprofit'); continue; }\n  const domain = toDomain(c.website);\n  if (!domain)                     { rejectYc('no usable domain'); continue; }\n  // Tested against the short fields only. A long description says \"deploy\"\n  // about its own product often enough to reject half the directory.\n  if (VENDOR.test([c.one_liner || '', (c.tags || []).join(' ')].join(' ')))\n                                   { rejectYc('sells infrastructure tooling'); continue; }\n  const ym = /(19|20)\\d{2}/.exec(c.batch || '');\n  const batchYear = ym ? Number(ym[0]) : null;\n  if (batchYear === null || batchYear < NOW_YEAR - MAX_BATCH_AGE)\n                                   { rejectYc('batch older than the window'); continue; }\n\n  // Priority, highest first. Hiring now dominates, then the size band where a\n  // company is certain to have no platform team, then recency.\n  const priority = (c.isHiring ? 100 : 0)\n                 + (ts >= 15 && ts <= 80 ? 50 : 0)\n                 + (batchYear - (NOW_YEAR - MAX_BATCH_AGE));\n\n  candidates.push({\n    source: 'radar_yc',\n    external_id: c.slug || String(c.id),\n    domain,\n    name: c.name,\n    website: c.website || null,\n    country: (c.all_locations || '').split(',').pop().trim() || null,\n    industry: c.industry || null,\n    employee_count: ts,\n    description: (c.one_liner || '').slice(0, 500) || null,\n    priority,\n    evidence: {\n      url: c.url || null,\n      note: 'YC ' + (c.batch || 'unknown batch') + ', team size ' + ts\n          + (c.isHiring ? ', currently hiring' : '') + '. '\n          + 'Team size is the whole company, so the engineering team is smaller; '\n          + 'whether anyone owns infrastructure is unverified and is WF-02 work.'\n    }\n  });\n}\n\n// ------------------------------------------------- Hacker News \"Who is hiring?\"\n// The strongest free signal for this thesis. Each top-level comment is one\n// company listing its open roles, so the roles it does NOT list are readable.\nconst thread = $('Fetch HN Thread').first().json || {};\nconst children = thread.children || [];\nstats.hn_total = children.length;\nstats.hn_thread = thread.id || null;\n\nfor (const c of children) {\n  const raw = c.text || '';\n  if (!raw) { rejectHn('empty comment'); continue; }\n  const text = raw.replace(/<[^>]+>/g, ' ')\n                  .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n                  .replace(/&quot;/g, '\"').replace(/&#x27;/g, \"'\").replace(/&#x2F;/g, '/');\n  const header = text.split('\\n')[0].slice(0, 400);\n\n  // The whole point. They are hiring the person being sold.\n  if (INFRA_ROLE.test(text))      { rejectHn('hiring infrastructure'); continue; }\n  if (VENDOR_PRODUCT.test(text))  { rejectHn('sells or operates infrastructure tooling'); continue; }\n  if (!ENG_ROLE.test(header))     { rejectHn('no engineering role in the header'); continue; }\n\n  const urls = raw.replace(/&#x2F;/g, '/').match(/https?:\\/\\/[^\\s<>\"')]+/g) || [];\n  let domain = null;\n  for (const u of urls) { const d = toDomain(u); if (d) { domain = d; break; } }\n  if (!domain)                    { rejectHn('no usable domain'); continue; }\n\n  candidates.push({\n    source: 'radar_hn',\n    external_id: String(c.id),\n    domain,\n    // Most listings open \"Company | Role | Location\". The ones that do not are\n    // prose, and the first 120 characters of prose is not a company name - the\n    // domain is a worse name but never an embarrassing one, and WF-02 corrects\n    // it from the company's own site either way.\n    name: (header.includes('|')\n            ? header.split('|')[0].replace(/\\([^)]*https?:[^)]*\\)/gi, '').trim().slice(0, 120)\n            : '') || domain,\n    website: 'https://' + domain,\n    country: null,\n    industry: null,\n    employee_count: null,\n    description: header.slice(0, 500),\n    // Above every YC candidate on purpose, and this is the one ordering\n    // decision in the file that matters. The YC directory is permanent - a\n    // company deferred today is still there next week. The HN thread is a\n    // one-month window that is replaced on the first of the month, so a\n    // listing not taken now is not deferred, it is lost. Perishable first.\n    priority: 200,\n    evidence: {\n      url: 'https://news.ycombinator.com/item?id=' + c.id,\n      note: 'Hacker News \"Who is hiring?\" ' + String(thread.title || '').replace(/^Ask HN: /, '')\n          + '. Listed roles with no infrastructure role among them: '\n          + header.slice(0, 200)\n    }\n  });\n}\n\n// ------------------------------------------------------------- OpenStreetMap\n// Businesses in the region that list a website: the source for the automation\n// line (docs/lead-discovery.md). One Overpass response per country, each item\n// carrying the ISO code it was asked for.\n//\n// A chain is not a prospect: the same domain on more than a few map points is\n// a retailer with a head office, a procurement department and an IT team. The\n// categories are an allowlist of businesses whose work is orders, stock,\n// shipments or clients - the repetitive back office this line sells against.\nconst OSM_MAX_LOCATIONS = Number($env.DISCOVERY_OSM_MAX_LOCATIONS || 3);\n// The weights follow the active ICP segments (0024_icp_segments.sql): the\n// categories a segment has an offer for are read first, the rest (the\n// regional_other control) after them.\nconst OSM_OFFICE = {\n  logistics: 40, courier: 40, advertising_agency: 40, marketing: 40, accountant: 40,\n  employment_agency: 15, travel_agent: 15, insurance: 10, estate_agent: 10,\n  consulting: 10, company: 5, it: 5,\n};\nconst OSM_SHOP = new Set([\n  'furniture','electronics','computer','mobile_phone','appliance','clothes','shoes','bag',\n  'fashion_accessories','jewelry','watches','cosmetics','perfumery','sports','outdoor',\n  'bicycle','car_parts','tyres','hardware','doityourself','houseware','kitchen','lighting',\n  'interior_decoration','bathroom_furnishing','tiles','flooring','paint','garden_centre',\n  'pet','toys','baby_goods','books','stationery','gift','wine','alcohol','coffee','tea',\n  'health_food','medical_supply','fabric','sewing','wholesale','trade','agrarian',\n]);\n// Places that are not the company: social profiles, site builders' free\n// subdomains, marketplaces and link pages.\nconst OSM_NOT_A_SITE = /(^|\\.)(facebook\\.com|instagram\\.com|google\\.com|goo\\.gl|business\\.site|wixsite\\.com|linktr\\.ee|tiktok\\.com|olx\\.ba|kupujemprodajem\\.com|njuskalo\\.hr|booking\\.com|tripadvisor\\.com|wa\\.me|viber\\.com|blogspot\\.com|wordpress\\.com)$/;\n\n// OSM Snapshot answers one item per country: the last good response WF-12\n// saved (origin 'snapshot'), or nothing yet (origin 'none').\nconst osmSeen = new Map();\nfor (const item of $('OSM Snapshot').all()) {\n  const iso = item.json.iso;\n  if (!iso) continue;\n  stats.osm_origin[iso] = item.json.origin + (item.json.problem ? ' (' + item.json.problem + ')' : '');\n  let els = [];\n  try { els = JSON.parse(item.json.data || '').elements || []; }\n  catch (e) { stats.osm_failed.push(iso); continue; }\n  stats.osm_countries[iso] = els.length;\n  for (const e of els) {\n    const t = e.tags || {};\n    const site = t.website || t['contact:website'];\n    const domain = toDomain(/^https?:\\/\\//i.test(site || '') ? site : 'https://' + (site || ''));\n    if (!domain || OSM_NOT_A_SITE.test(domain)) { rejectOsm('no company website'); continue; }\n    const entry = osmSeen.get(domain) || { domain, count: 0, first: e, iso, kind: null, weight: -1, brand: null };\n    entry.count += 1;\n    // brand:wikidata / operator:wikidata is how OSM marks a branch of a known\n    // chain (the Name Suggestion Index). A country has one DHL depot, so the\n    // location count alone let DHL, DB Schenker and Adecco through to research\n    // on 2026-09-25. About one element in five carries the tag.\n    entry.brand = entry.brand || t['brand:wikidata'] || t['operator:wikidata'] || null;\n    const weight = t.office ? (OSM_OFFICE[t.office] ?? -1) : (OSM_SHOP.has(t.shop) ? 35 : -1);\n    if (weight > entry.weight) { entry.weight = weight; entry.first = e; entry.kind = t.office ? 'office=' + t.office : 'shop=' + t.shop; }\n    osmSeen.set(domain, entry);\n  }\n}\nstats.osm_total = osmSeen.size;\nfor (const o of osmSeen.values()) {\n  if (o.count > OSM_MAX_LOCATIONS) { rejectOsm('chain: ' + o.count + ' locations'); continue; }\n  if (o.brand)                     { rejectOsm('branch of a known chain'); continue; }\n  if (o.weight < 0)                { rejectOsm('category outside the allowlist'); continue; }\n  const t = o.first.tags || {};\n  const city = t['addr:city'] || t['addr:place'] || null;\n  candidates.push({\n    source: 'radar_osm',\n    external_id: o.first.type + '/' + o.first.id,\n    domain: o.domain,\n    name: (t.name || t.brand || o.domain).slice(0, 120),\n    website: 'https://' + o.domain,\n    country: o.iso,\n    industry: 'OSM ' + o.kind,\n    employee_count: null,\n    description: [o.kind, city].filter(Boolean).join(', ').slice(0, 500),\n    // Ranks candidates inside their ICP segment; how many a segment gets is\n    // its discovery_share (0025_segment_allocation.sql), not the priority.\n    priority: 150 + o.weight,\n    evidence: {\n      url: 'https://www.openstreetmap.org/' + o.first.type + '/' + o.first.id,\n      note: 'OpenStreetMap: ' + o.kind + (city ? ' in ' + city : '') + ', ' + o.iso\n          + ', website listed, ' + o.count + ' location(s). Map data (c) OpenStreetMap contributors, ODbL.'\n    }\n  });\n}\n\n// ------------------------------------------------- Minimax's office directory\n// The accounting offices that use Minimax, as Minimax lists them so that\n// entrepreneurs can find a bookkeeper (0029_minimax_directory.sql). Being on\n// the list is itself the sourced fact a segment email opens with - the office\n// keeps its clients' books in Minimax - so the signal carries a confidence the\n// map's categories never earn.\nstats.directory_total = 0; stats.directory_countries = {};\nfor (const item of $('Directory Snapshot').all()) {\n  const j = item.json;\n  if (!j.iso || j.source !== 'radar_minimax') continue;\n  let entries = [];\n  try { entries = JSON.parse(j.data || '[]'); } catch (e) { stats.osm_failed.push('minimax ' + j.iso); continue; }\n  stats.directory_countries[j.iso] = entries.length;\n  for (const o of entries) {\n    const domain = toDomain('https://' + (o.domain || ''));\n    if (!domain || OSM_NOT_A_SITE.test(domain)) continue;\n    stats.directory_total += 1;\n    candidates.push({\n      source: 'radar_minimax',\n      external_id: j.iso + '/' + o.slug,\n      domain,\n      name: String(o.name || domain).slice(0, 120),\n      website: o.website ? (/^https?:\\/\\//i.test(o.website) ? o.website.trim() : 'https://' + o.website.trim()) : 'https://' + domain,\n      country: j.iso,\n      industry: 'Minimax accounting directory',\n      employee_count: null,\n      description: ['accounting office, works in Minimax', o.city].filter(Boolean).join(', ').slice(0, 500),\n      // The same weight as a mapped accountant, a little more when the office\n      // gave Minimax a website: research has a page to read.\n      priority: 190 + (o.website ? 5 : 0),\n      evidence: {\n        url: j.url,\n        confidence: 0.9,\n        note: 'Listed in Minimax\\'s public directory of accounting services (' + j.iso + ')'\n            + (o.address ? ', ' + o.address : '') + ', so the office keeps its clients\\' books in Minimax.'\n      }\n    });\n  }\n}\n\nreturn [{\n  json: {\n    daily_limit: DAILY_LIMIT,\n    candidate_count: candidates.length,\n    candidates,\n    stats\n  }\n}];"
+      },
+      "id": "c1-05",
+      "name": "Select Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ],
+      "notes": "The thesis, in two regular expressions: reject anyone advertising an infrastructure role, keep anyone advertising engineering roles without one."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Record every candidate this run decided about, and insert the ones that\n-- became companies. One statement, because a company inserted without its\n-- discovery_seen row would be re-evaluated every morning forever, and a\n-- discovery_seen row written without its company would lose the candidate\n-- permanently.\n--\n-- Deferred candidates are deliberately NOT recorded. The directory holds far\n-- more companies than a day's research budget, so the surplus has to come back\n-- tomorrow, and the only thing making that happen is its absence from\n-- discovery_seen.\nWITH payload AS (\n    SELECT $1::jsonb AS p\n),\ncand AS (\n    SELECT\n        c ->> 'source'                          AS source,\n        c ->> 'external_id'                     AS external_id,\n        lower(c ->> 'domain')::citext           AS domain,\n        c ->> 'name'                            AS name,\n        c ->> 'website'                         AS website,\n        c ->> 'country'                         AS country,\n        c ->> 'industry'                        AS industry,\n        nullif(c ->> 'employee_count', '')::int AS employee_count,\n        c ->> 'description'                     AS description,\n        coalesce((c ->> 'priority')::int, 0)    AS priority,\n        c -> 'evidence'                         AS evidence\n    FROM payload, jsonb_array_elements(p -> 'candidates') AS c\n    WHERE coalesce(btrim(c ->> 'domain'), '') <> ''\n),\n-- Anything decided on a previous run is gone for good, accepted or rejected.\nfresh AS (\n    SELECT c.*\n    FROM cand c\n    WHERE NOT EXISTS (\n        SELECT 1 FROM discovery_seen s\n        WHERE s.source = c.source AND s.external_id = c.external_id\n    )\n),\n-- The same company can appear in both sources in the same run, and companies\n-- has a unique domain. Keep the better-evidenced row. One per brand as well\n-- (0027): officebrand.example and shop.officebrand.example arrived in the same run.\ndeduped AS (\n    SELECT DISTINCT ON (domain_brand(domain::text)) *\n    FROM fresh\n    ORDER BY domain_brand(domain::text), priority DESC, source, domain\n),\nclassified AS (\n    SELECT d.*,\n        CASE\n            WHEN EXISTS (\n                SELECT 1 FROM suppression_list sl\n                WHERE sl.domain IS NOT NULL AND sl.domain = d.domain\n            ) THEN 'suppressed'\n            WHEN EXISTS (\n                SELECT 1 FROM companies co WHERE co.domain = d.domain\n            ) THEN 'already_known'\n            -- The same company on another domain (0027_draft_quality.sql):\n            -- ba.shopbrand.example after shopbrand.example, shop.officebrand.example after officebrand.example.\n            WHEN EXISTS (\n                SELECT 1 FROM companies co\n                WHERE domain_brand(co.domain::text) = domain_brand(d.domain::text)\n            ) THEN 'already_known'\n            ELSE NULL\n        END AS rejected\n    FROM deduped d\n),\n-- The day's slots are shared out by ICP segment (0025_segment_allocation.sql):\n-- each active segment first gets its discovery_share of the daily limit, then\n-- whatever a segment could not use goes to the best remaining candidates of the\n-- segments that have a share. A candidate in a segment with no share is never\n-- taken, which is what keeps a source's easiest companies from filling the\n-- table. regional_other has a share and no outreach: research reads those\n-- companies and reclassifies them by what they do (segment_from_research).\nlim AS (\n    SELECT greatest(0, coalesce((SELECT (p ->> 'daily_limit')::int FROM payload), 25)) AS n\n),\nranked AS (\n    SELECT c.*, s.discovery_share,\n           row_number() OVER (PARTITION BY s.code ORDER BY c.priority DESC, c.domain) AS seg_rank\n    FROM classified c\n    JOIN icp_segments s ON s.code = segment_for(c.source, c.industry) AND s.discovery_share > 0\n    WHERE c.rejected IS NULL\n),\nby_share AS (\n    SELECT r.*\n    FROM ranked r, lim\n    WHERE r.seg_rank <= ceil(lim.n * r.discovery_share / 100.0)\n),\naccepted AS (\n    (SELECT * FROM by_share ORDER BY priority DESC, domain LIMIT (SELECT n FROM lim))\n    UNION ALL\n    (SELECT r.* FROM ranked r\n     WHERE NOT EXISTS (SELECT 1 FROM by_share b WHERE b.domain = r.domain)\n     ORDER BY r.priority DESC, r.domain\n     LIMIT greatest(0, (SELECT n FROM lim) - (SELECT count(*) FROM by_share)))\n),\ninserted AS (\n    INSERT INTO companies (\n        name, domain, website, country, industry,\n        employee_count, description, source, status\n    )\n    SELECT\n        left(btrim(a.name), 200), a.domain, a.website, a.country, a.industry,\n        a.employee_count, left(a.description, 2000), a.source, 'new'\n    FROM accepted a\n    WHERE btrim(coalesce(a.name, '')) <> ''\n    ON CONFLICT (domain) DO NOTHING\n    RETURNING id, domain, name\n),\n-- Why this company is in the table at all. Confidence is deliberately low:\n-- being in a directory is not evidence of anything except being in a directory.\n-- The exception says so in its evidence: Minimax's own list of the offices that\n-- use it is evidence of exactly that (0029_minimax_directory.sql).\nsig AS (\n    INSERT INTO signals (company_id, signal_type, signal, source_url, confidence)\n    SELECT i.id, 'other', left(a.evidence ->> 'note', 1000), a.evidence ->> 'url',\n           coalesce((a.evidence ->> 'confidence')::numeric, 0.20)\n    FROM inserted i\n    JOIN accepted a ON a.domain = i.domain\n    WHERE coalesce(btrim(a.evidence ->> 'note'), '') <> ''\n    ON CONFLICT DO NOTHING\n    RETURNING id\n),\nseen AS (\n    INSERT INTO discovery_seen (source, external_id, domain, rejected)\n    SELECT source, external_id, domain, rejected FROM classified WHERE rejected IS NOT NULL\n    UNION ALL\n    SELECT source, external_id, domain, NULL FROM accepted\n    ON CONFLICT (source, external_id) DO NOTHING\n    RETURNING id\n)\nSELECT\n    (SELECT count(*) FROM cand)                                      AS candidates_in,\n    (SELECT count(*) FROM fresh)                                     AS not_seen_before,\n    (SELECT count(*) FROM classified WHERE rejected = 'already_known') AS already_known,\n    (SELECT count(*) FROM classified WHERE rejected = 'suppressed')    AS suppressed,\n    (SELECT count(*) FROM accepted)                                  AS accepted,\n    (SELECT count(*) FROM inserted)                                  AS companies_inserted,\n    (SELECT count(*) FROM sig)                                       AS signals_inserted,\n    (SELECT count(*) FROM seen)                                      AS seen_recorded,\n    greatest(0, (SELECT count(*) FROM classified WHERE rejected IS NULL)\n              - (SELECT count(*) FROM accepted))                     AS deferred_to_tomorrow,\n    (SELECT coalesce(jsonb_agg(jsonb_build_object('domain', domain, 'name', name)), '[]'::jsonb)\n     FROM inserted)                                                  AS inserted_companies",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ daily_limit: $json.daily_limit, candidates: $json.candidates }) }}"
+        }
+      },
+      "id": "p1-06",
+      "name": "Record Candidates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2040,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One batched line a day. Discovery is not urgent and must never compete with\n-- an approval request for attention; docs/telegram.md's rule is that an unmuted\n-- channel is worth more than a complete one.\n--\n-- The dedup key carries the date, so a second run on the same day folds into\n-- the first rather than sending twice.\nSELECT *\nFROM queue_notification(\n    'system',\n    'system:discovery:' || to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD'),\n    'Discovery: ' || ($1::jsonb ->> 'companies_inserted') || ' new companies',\n    'WF-01 added ' || ($1::jsonb ->> 'companies_inserted') || ' companies to the research queue.'\n        || E'\\n' || 'Considered ' || ($1::jsonb ->> 'candidates_in')\n        || ', already known ' || ($1::jsonb ->> 'already_known')\n        || ', suppressed ' || ($1::jsonb ->> 'suppressed')\n        || ', left for tomorrow ' || ($1::jsonb ->> 'deferred_to_tomorrow') || '.'\n        || E'\\n\\n'\n        || coalesce(\n             (SELECT string_agg('  ' || (e ->> 'domain') || '  ' || (e ->> 'name'), E'\\n')\n              FROM jsonb_array_elements($1::jsonb -> 'inserted_companies') AS e),\n             '  (none)'),\n    'batched',\n    $1::jsonb,\n    NULL,\n    NULL,\n    interval '12 hours'\n)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ candidates_in: $json.candidates_in, already_known: $json.already_known, suppressed: $json.suppressed, accepted: $json.accepted, companies_inserted: $json.companies_inserted, signals_inserted: $json.signals_inserted, deferred_to_tomorrow: $json.deferred_to_tomorrow, inserted_companies: $json.inserted_companies }) }}"
+        }
+      },
+      "id": "p1-07",
+      "name": "Queue Discovery Alert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2260,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Batched, not immediate. A discovery run is a fact for the morning report, not an interruption."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- OpenStreetMap comes from the snapshot WF-12 keeps, never from the network:\n-- a morning when Overpass is down or refusing this IP costs nothing here.\n--\n-- One row per country in DISCOVERY_OSM_COUNTRIES, with origin 'none' for a\n-- country WF-12 has not fetched yet. Always at least one row: an empty output\n-- would stop the workflow here and YC and Hacker News would never be recorded.\n-- With OSM switched off the row carries no country.\nWITH p AS (SELECT $1::jsonb AS j),\nc AS (\n    SELECT iso, ord\n    FROM p, unnest(string_to_array(upper(regexp_replace(p.j ->> 'countries', '\\s', '', 'g')), ',')) WITH ORDINALITY AS u(iso, ord)\n    WHERE iso ~ '^[A-Z]{2}$'\n)\nSELECT c.iso,\n       s.payload                                               AS data,\n       CASE WHEN s.country IS NULL THEN 'none' ELSE 'snapshot' END AS origin,\n       s.fetched_at                                            AS snapshot_at,\n       CASE WHEN s.country IS NULL THEN 'no snapshot yet (WF-12)' END AS problem\nFROM c\nLEFT JOIN osm_snapshot s ON s.country = c.iso\nUNION ALL\nSELECT NULL, NULL, 'disabled', NULL, NULL\nWHERE NOT EXISTS (SELECT 1 FROM c)\nORDER BY 1;",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ countries: String($env.DISCOVERY_OSM_COUNTRIES ?? '') }) }}"
+        }
+      },
+      "id": "h1-osm4",
+      "name": "OSM Snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        940,
+        460
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Public directories, from the snapshot make minimax-refresh keeps\n-- (0029_minimax_directory.sql). One row per directory and country. Always at\n-- least one row: an empty output would stop the workflow here and no source\n-- would be recorded.\nSELECT d.source, d.country AS iso, d.url, d.entries::text AS data, d.fetched_at AS snapshot_at\nFROM directory_snapshot d\nUNION ALL\nSELECT NULL, NULL, NULL, NULL, NULL\nWHERE NOT EXISTS (SELECT 1 FROM directory_snapshot)\nORDER BY 1, 2;",
+        "options": {}
+      },
+      "id": "h1-dir1",
+      "name": "Directory Snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1140,
+        620
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "vUxYVHnmuty8Jcgk",
+          "name": "Postgres account"
+        }
+      },
+      "executeOnce": true
+    }
+  ],
+  "connections": {
+    "Daily At 06:10": {
+      "main": [
+        [
+          {
+            "node": "Fetch YC Directory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch YC Directory": {
+      "main": [
+        [
+          {
+            "node": "Fetch HN Index",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch HN Index": {
+      "main": [
+        [
+          {
+            "node": "Pick HN Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick HN Thread": {
+      "main": [
+        [
+          {
+            "node": "Fetch HN Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch HN Thread": {
+      "main": [
+        [
+          {
+            "node": "OSM Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Candidates": {
+      "main": [
+        [
+          {
+            "node": "Record Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Candidates": {
+      "main": [
+        [
+          {
+            "node": "Queue Discovery Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OSM Snapshot": {
+      "main": [
+        [
+          {
+            "node": "Directory Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Directory Snapshot": {
+      "main": [
+        [
+          {
+            "node": "Select Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "saveManualExecutions": true,
+    "errorWorkflow": "wf99ErrorHandler"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "instanceId": "ai-sales-machine"
+  }
+}

@@ -1,0 +1,51 @@
+# Copy to ./Caddyfile before `make up`. The real Caddyfile is gitignored.
+#
+#   cp Caddyfile.example Caddyfile
+#
+# {$CADDY_DOMAIN} and {$CADDY_EMAIL} are read from the container environment,
+# which docker-compose.yml populates from .env. Nothing here is a secret, but
+# the live file is kept out of git so the real hostname is not published.
+
+{
+	email {$CADDY_EMAIL}
+	# Uncomment while testing to avoid burning Let's Encrypt rate limits:
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$CADDY_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# The editor is protected by the n8n owner account only (basic auth was
+	# removed in n8n 1.0). No workflow uses a webhook, so this site should be
+	# reachable on loopback only. Remote access is `tailscale serve`, see docs/setup.md.
+	reverse_proxy n8n:5678 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		flush_interval -1
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+# Local access without TLS while there is no public domain yet.
+# Reachable as http://localhost/ from the host itself.
+:80 {
+	@local host localhost 127.0.0.1
+	handle @local {
+		reverse_proxy n8n:5678
+	}
+	handle {
+		abort
+	}
+}

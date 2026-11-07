@@ -1,0 +1,77 @@
+{
+  "$comment": "The offer catalogue: what this pipeline can sell, grouped by line. WF-04 and WF-05 read it at run time; the agent schemas, the leads constraint and the prompts must agree with it, and infra/scripts/check-offers.py (make validate) fails when they do not. Adding an offer means editing this file, a migration for leads.recommended_offer, the enums it names, and the prompts' offer tables. Prices are what prompts/conversation.md may quote, and check-offers.py fails when a prompt's offer table states a different one. price_eur, credit_window_days and founding are the Process Automation Audit's published terms (the process-audit page at lines.automation.url, https://example.com/process-audit/). Taglines and URLs are placeholders: replace Your Company and example.com with your own business before sending anything. campaigns.offer (0026) must name one of these codes.",
+  "lines": {
+    "infrastructure": {
+      "name": "Infrastructure",
+      "tagline": "Your Company - infrastructure audits, DevOps and SRE",
+      "tagline_sr": "Your Company - infrastruktura, DevOps i SRE",
+      "url": "https://example.com/infrastructure/",
+      "default_offer": "infrastructure_audit"
+    },
+    "automation": {
+      "name": "Business process automation",
+      "tagline": "Your Company - business process automation",
+      "tagline_sr": "Your Company - automatizacija poslovnih procesa",
+      "url": "https://example.com/",
+      "default_offer": "process_audit"
+    }
+  },
+  "offers": [
+    {
+      "code": "infrastructure_audit",
+      "line": "infrastructure",
+      "name": "Infrastructure Audit",
+      "use_when": "Evidence of an infrastructure problem, unclear cause",
+      "price": "EUR 500 - 1,000"
+    },
+    {
+      "code": "devops_improvement_sprint",
+      "line": "infrastructure",
+      "name": "DevOps Improvement Sprint",
+      "use_when": "Specific, bounded, known infrastructure problem",
+      "price": "EUR 1,500 - 4,000"
+    },
+    {
+      "code": "fractional_devops_sre",
+      "line": "infrastructure",
+      "name": "Fractional DevOps/SRE",
+      "use_when": "Ongoing need, no one to own the infrastructure",
+      "price": "EUR 1,000 - 3,000+ / month"
+    },
+    {
+      "code": "process_audit",
+      "line": "automation",
+      "name": "Process Automation Audit",
+      "use_when": "Repetitive work done by hand, or people hired to do it",
+      "price": "EUR 1,200 fixed, excl. VAT",
+      "price_eur": 1200,
+      "currency": "EUR",
+      "credit_window_days": 60,
+      "credit_rule": "If the client starts an automation build within 60 days of the report, the full audit fee is credited against the build.",
+      "founding": {
+        "price_eur": 600,
+        "slots": 3,
+        "condition": "the client agrees to be a named reference (a short case study, approved by them before publishing)"
+      },
+      "deliverables": [
+        "process map as it actually runs",
+        "manual work and where the hours go",
+        "system and integration gaps",
+        "steps worth automating, ranked by cost",
+        "what should stay with people",
+        "proposed architecture",
+        "implementation estimate",
+        "roadmap and recommended next step"
+      ],
+      "target_segments": [
+        "webshops",
+        "accounting_offices",
+        "logistics",
+        "agencies"
+      ],
+      "cta": "A short call about one process, then a fixed-price audit if it fits",
+      "url": "https://example.com/process-audit/",
+      "active": true
+    }
+  ]
+}
