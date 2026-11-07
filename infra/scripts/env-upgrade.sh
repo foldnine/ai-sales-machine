@@ -58,7 +58,7 @@ if ! grep -q '^BOT_USER_AGENT=' "$ENV_FILE"; then
 fi
 # Added with the dashboard and the automatic n8n owner. Secrets are generated
 # on --apply, never shown; the rest get the .env.example default.
-NEW_VARS="N8N_OWNER_EMAIL N8N_OWNER_NAME N8N_OWNER_PASSWORD DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET DASHBOARD_DB_PASSWORD DASHBOARD_BIND_ADDR DASHBOARD_PORT"
+NEW_VARS="N8N_OWNER_EMAIL N8N_OWNER_NAME N8N_OWNER_PASSWORD DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET DASHBOARD_DB_PASSWORD DASHBOARD_BIND_ADDR DASHBOARD_PORT DASHBOARD_STYLE"
 missing_new=""
 for v in $NEW_VARS; do
     if ! grep -q "^${v}=" "$ENV_FILE"; then
@@ -129,6 +129,7 @@ if [[ -n "$missing_new" ]]; then
             N8N_OWNER_NAME)           val='"AI Sales Operator"' ;;
             DASHBOARD_BIND_ADDR)      val="127.0.0.1" ;;
             DASHBOARD_PORT)           val="3000" ;;
+            DASHBOARD_STYLE)          val="default" ;;
             *)                        val="" ;;
         esac
         printf '%s=%s\n' "$v" "$val" >> "$tmp"

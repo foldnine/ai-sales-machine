@@ -16,7 +16,7 @@ export function hrefWith(base: string, params: Record<string, string | undefined
 export function Chip({ href, active, children, count }: { href: string; active: boolean; children: React.ReactNode; count?: number }) {
   return (
     <Link href={href} scroll={false}
-      className={cn("inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 text-[12px] transition-colors",
+      className={cn("chip inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 text-[12px] transition-colors",
         active ? "border-accent/40 bg-accent-soft text-accent" : "bg-surface text-fg-muted hover:border-border-strong hover:text-fg")}>
       {children}
       {count != null ? <span className="tabular text-[11px] opacity-70">{count}</span> : null}

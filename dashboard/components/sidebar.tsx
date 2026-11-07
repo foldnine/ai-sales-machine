@@ -24,7 +24,7 @@ export function Sidebar({ counts }: { counts: Counts }) {
   const pathname = usePathname();
   const sending = !counts.paused;
   return (
-    <aside className="sticky top-0 hidden h-dvh w-[232px] shrink-0 flex-col border-r bg-bg-subtle md:flex">
+    <aside className="sidebar-material sticky top-0 hidden h-dvh w-[232px] shrink-0 flex-col border-r bg-bg-subtle md:flex">
       <div className="flex h-12 items-center gap-2.5 px-4">
         <svg viewBox="0 0 32 32" className="size-6" aria-hidden>
           <rect width="32" height="32" rx="8" className="fill-accent" />

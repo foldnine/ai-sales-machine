@@ -123,3 +123,85 @@
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
 }
+
+/* ---------------------------------------------------------------------------
+   Apple style (data-style="apple" on <html>): the macOS Human Interface
+   Guidelines' system palette, SF Pro via the system font stack, larger radii,
+   capsule filters, hairline separators and a translucent sidebar material.
+   Same tokens, so every component follows.
+   --------------------------------------------------------------------------- */
+[data-style="apple"] {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", var(--font-geist-sans), "Helvetica Neue", sans-serif;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --bg: #f5f5f7;
+  --bg-subtle: #ececf0;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --border: rgb(60 60 67 / 0.12);
+  --border-strong: rgb(60 60 67 / 0.22);
+  --fg: #1d1d1f;
+  --fg-muted: rgb(60 60 67 / 0.72);
+  --fg-subtle: rgb(60 60 67 / 0.5);
+  --accent: #007aff;
+  --accent-fg: #ffffff;
+  --accent-soft: rgb(0 122 255 / 0.1);
+  --ring: rgb(0 122 255 / 0.35);
+  --success: #28a745;
+  --success-soft: rgb(52 199 89 / 0.14);
+  --warning: #c27c00;
+  --warning-soft: rgb(255 149 0 / 0.14);
+  --danger: #e0352b;
+  --danger-soft: rgb(255 59 48 / 0.12);
+  --chart-1: #007aff;
+  --chart-2: #5ac8fa;
+  --chart-3: #34c759;
+  --chart-4: #ff9f0a;
+  --chart-5: #af52de;
+  --shadow: 0 1px 3px rgb(0 0 0 / 0.05), 0 4px 14px rgb(0 0 0 / 0.04);
+}
+[data-style="apple"].dark {
+  --bg: #000000;
+  --bg-subtle: #1c1c1e;
+  --surface: #1c1c1e;
+  --surface-raised: #2c2c2e;
+  --border: rgb(84 84 88 / 0.5);
+  --border-strong: rgb(84 84 88 / 0.8);
+  --fg: #f5f5f7;
+  --fg-muted: rgb(235 235 245 / 0.7);
+  --fg-subtle: rgb(235 235 245 / 0.42);
+  --accent: #0a84ff;
+  --accent-soft: rgb(10 132 255 / 0.2);
+  --ring: rgb(10 132 255 / 0.45);
+  --success: #30d158;
+  --success-soft: rgb(48 209 88 / 0.18);
+  --warning: #ff9f0a;
+  --warning-soft: rgb(255 159 10 / 0.18);
+  --danger: #ff453a;
+  --danger-soft: rgb(255 69 58 / 0.18);
+  --chart-1: #0a84ff;
+  --chart-2: #64d2ff;
+  --chart-3: #30d158;
+  --chart-4: #ff9f0a;
+  --chart-5: #bf5af2;
+  --shadow: 0 0 0 0.5px rgb(255 255 255 / 0.06), 0 6px 20px rgb(0 0 0 / 0.35);
+}
+[data-style="apple"] body {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  letter-spacing: -0.003em;
+}
+[data-style="apple"] .page-title {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.022em;
+}
+[data-style="apple"] .chip {
+  border-radius: 9999px;
+}
+[data-style="apple"] .sidebar-material {
+  background: color-mix(in srgb, var(--bg-subtle) 72%, transparent);
+  backdrop-filter: saturate(180%) blur(24px);
+  -webkit-backdrop-filter: saturate(180%) blur(24px);
+}

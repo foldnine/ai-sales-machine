@@ -83,6 +83,7 @@ behind a proxy that rewrites the `Host` header, the proxy is the problem:
 | `DASHBOARD_SESSION_SECRET` | Signs the session cookie. Changing it signs everyone out |
 | `DASHBOARD_DB_PASSWORD` | Password of the `aisales_dashboard` role. After changing it run `make dashboard-role` |
 | `DASHBOARD_BIND_ADDR`, `DASHBOARD_PORT` | `127.0.0.1` and `3000`. Keep the address on loopback |
+| `DASHBOARD_STYLE` | `default` (dense, Linear-like) or `apple` (macOS system colours, SF Pro on Apple devices, larger radii, translucent sidebar). `make up` to apply |
 
 ## Troubleshooting
 

@@ -36,7 +36,7 @@ export default async function CompanyPage({ params }: { params: Promise<{ id: st
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-[20px] font-semibold tracking-tight">{c.name}</h1>
+                <h1 className="page-title text-[20px] font-semibold tracking-tight">{c.name}</h1>
                 <Badge tone={companyStatusTone(c.status)}>{humanize(c.status)}</Badge>
                 {c.suppressed ? <Badge tone="danger"><ShieldOff className="size-3" /> Suppressed</Badge> : null}
               </div>
