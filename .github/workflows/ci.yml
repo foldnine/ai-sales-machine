@@ -41,4 +41,4 @@ jobs:
         run: make secrets-scan
 
       - name: shellcheck
-        run: shellcheck --severity=error scripts/*.sh infra/scripts/*.sh
+        run: shellcheck --severity=error install.sh scripts/*.sh infra/scripts/*.sh
