@@ -389,5 +389,5 @@ line "  2. Make it yours           docs/customizing.md"
 line "  3. Set up the mailbox      docs/mail.md, then WF-06 and WF-08"
 line "  4. Before unpausing        docs/compliance.md"
 rule "╰──────────────────────────────────────────────────────────────────╯"
-note "Remote access: tailscale serve --bg $dash_port  (never a port forward - docs/setup.md)"
+note "Remote access: tailscale serve --bg --https=8443 $dash_port  (never a port forward - docs/setup.md)"
 printf '\n'

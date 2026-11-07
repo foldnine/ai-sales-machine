@@ -54,9 +54,13 @@ section "Containers"
 if ! command -v docker >/dev/null 2>&1; then
     fail "docker CLI not found"
 else
-    for c in aisales-postgres aisales-n8n aisales-dashboard aisales-caddy; do
+    for c in aisales-postgres aisales-n8n aisales-dashboard; do
         check_container "$c"
     done
+    # Caddy is an optional profile (docker-compose.yml): checked only if it exists.
+    if docker inspect aisales-caddy >/dev/null 2>&1; then
+        check_container aisales-caddy
+    fi
 fi
 
 section "PostgreSQL"

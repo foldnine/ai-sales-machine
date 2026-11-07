@@ -256,6 +256,10 @@ services:
     <<: *common
     image: ${CADDY_IMAGE:-caddy:2.8-alpine}
     container_name: aisales-caddy
+    # Optional. Only for a public domain in front of n8n (inbound webhooks).
+    # Remote access is `tailscale serve`, which needs no Caddy, so a default
+    # `make up` leaves it out:  docker compose --profile caddy up -d
+    profiles: ["caddy"]
     depends_on:
       - n8n
     environment:

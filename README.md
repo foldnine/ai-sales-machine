@@ -25,6 +25,13 @@ every email.**
 ![local models](https://img.shields.io/badge/LLM-Ollama%20(local)-informational)
 ![stack](https://img.shields.io/badge/stack-n8n%20%2B%20PostgreSQL-orange)
 
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/screenshots/overview-dark.png">
+  <img src=".github/assets/screenshots/overview-light.png" alt="The AI Sales Machine dashboard: KPIs, 30-day activity, funnel, approval queue, latest replies and agent health" width="100%">
+</picture>
+
 </div>
 
 ---
@@ -43,7 +50,7 @@ because it is hard.
 This system does that reading. It finds companies with evidence of a need,
 researches them, keeping facts apart from inference. It scores them against
 a rubric and writes one short, specific message per company. Then it waits
-for you to approve it on Telegram.
+for you to approve it, in the dashboard or on Telegram.
 
 Everything else exists to keep that judgement repeatable and to stop it from
 turning into spam: the schema, the guards in the database, the approval queue.
@@ -61,7 +68,12 @@ turning into spam: the schema, the guards in the database, the approval queue.
   score band computed by the database, not the model.
 - **Outreach that may refuse to write.** About 120 words, one sourced problem,
   one offer, one question. If the evidence is too thin, the agent declines.
-- **Human approval on Telegram.** `/approve`, `/reject`, daily report, alerts.
+- **A real dashboard.** Pipeline overview, an approval queue that shows each
+  draft next to the evidence behind it, company research with sources,
+  replies, segment and campaign performance, system health. Keyboard-driven,
+  dark and light, on your machine only.
+- **Human approval, in the browser or on Telegram.** Approve, edit or reject a
+  draft from the dashboard, or `/approve` and `/reject` from your phone.
   Optional *guarded autosend* for first messages that pass every automated
   check, off by default.
 - **Reply handling.** The inbox classifier sorts replies into eight categories,
@@ -170,22 +182,40 @@ credential n8n stores is encrypted with it.
 
 ### The dashboard
 
-A web console for the operator, served on loopback like everything else:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/screenshots/approvals-dark.png">
+  <img src=".github/assets/screenshots/approvals-light.png" alt="The approval queue: drafts by score on the left, the selected email with approve, edit and reject on the right, with the score breakdown" width="100%">
+</picture>
 
-- **Overview**: the funnel from discovered to replied, today's activity,
-  what needs you
-- **Approval queue**: each draft next to the evidence and score behind it.
-  Approve, edit or reject it from the browser. Same rules as Telegram:
-  suppression, limits and `OUTREACH_PAUSED` still apply
-- **Companies**: every company with its research facts, inferences, unknowns
-  and sources, its signals, contacts and score breakdown
-- **Replies**: classified inbound mail and open conversations
-- **Segments and campaigns**: what converts
-- **System**: agent runs, failures and health
+A web console for the operator at <http://localhost:3000>, served on loopback
+like everything else:
 
-It connects to PostgreSQL as `aisales_dashboard`. That role can read, and it
-can call the approval functions, but it cannot write to a table directly. To
-reach it from your other devices, use `tailscale serve --bg 3000`.
+- **Overview**: KPIs, 30 days of activity, the funnel from discovered to won,
+  what is waiting for you, the latest replies, agent health
+- **Approvals**: each draft next to the recipient, the signals and research
+  behind it and its score breakdown. Approve, edit or reject it, with the
+  keyboard if you like (`j`/`k`, `a`, `e`, `r`)
+- **Companies**: every company, filterable by segment, band and status, with
+  its research facts, inferences, unknowns and sources, contacts, messages
+  and agent runs
+- **Outreach** and **Replies**: every message and what happened to it; every
+  answer, classified
+- **Performance**: segments, campaigns and message variants, end to end
+- **System**: the sending switches (shown, never changed here), agent health,
+  failures, and an audit log of everything done from the dashboard
+
+Approving in a browser is a second way to cause a send, so it has *less*
+access than the workflows. It connects as its own database role,
+`aisales_dashboard`, which can read the public schema and call three logged
+functions. It cannot write a table, cannot see n8n's credentials, and cannot
+remove the signature or opt-out line from a draft: the database refuses the
+edit. Details in [`docs/dashboard.md`](docs/dashboard.md).
+
+To reach it from your other devices: `tailscale serve --bg --https=8443 3000`.
+
+Want to look around before your pipeline has data? On a throwaway install,
+`make seed-demo` loads an invented pipeline (every company is under the
+reserved `.example` domain).
 
 ### Manual install
 
@@ -284,6 +314,7 @@ switch sending on. It is not legal advice.
 | | |
 |---|---|
 | [`docs/setup.md`](docs/setup.md) | Full installation, remote access, backups, troubleshooting |
+| [`docs/dashboard.md`](docs/dashboard.md) | The web dashboard: pages, access model, development |
 | [`docs/customizing.md`](docs/customizing.md) | Adapting offers, prompts, ICP, sources and languages |
 | [`docs/architecture.md`](docs/architecture.md) | What it is, and why it is built this way |
 | [`docs/workflows.md`](docs/workflows.md) | Every workflow: inputs, outputs, guards, failure handling |
@@ -299,9 +330,11 @@ switch sending on. It is not legal advice.
 
 ```
 ├── install.sh             guided install; safe to re-run
-├── docker-compose.yml     PostgreSQL, n8n, dashboard, Caddy - pinned, healthchecked, loopback-only
+├── docker-compose.yml     PostgreSQL, n8n, dashboard (+ optional Caddy) - pinned, healthchecked, loopback-only
 ├── .env.example           every setting, documented; safe defaults
 ├── Makefile               make help
+├── install.sh             one-command install
+├── dashboard/             the web dashboard (Next.js, one read-only container)
 ├── agents/                per-agent contract (JSON Schema) + offers.json
 ├── prompts/               the prompts, read at run time
 ├── n8n/workflows/         exported workflow JSON (source of truth)
