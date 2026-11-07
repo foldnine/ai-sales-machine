@@ -141,13 +141,28 @@ section "Sender identity"
 # The repository ships with placeholder identity. A message signed "Your Name"
 # with a link to example.com is worse than no message: edit these first
 # (docs/customizing.md). Reported, never a failure.
-if grep -q 'Your Name' prompts/signature.md 2>/dev/null; then
+# Whole lines only: the note at the top of the file names the placeholder too.
+if grep -qx 'Your Name' prompts/signature.md 2>/dev/null; then
     warn "prompts/signature.md still says 'Your Name' - edit before sending"
 else
     ok "prompts/signature.md has a sender name"
 fi
-if grep -q 'example\.com' agents/offers.json 2>/dev/null; then
-    warn "agents/offers.json still points at example.com - edit before sending"
+# The taglines and URLs, not the $comment that explains them.
+if python3 -c '
+import json, sys
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k in ("tagline", "tagline_sr", "url") and isinstance(v, str):
+                yield v
+            else:
+                yield from walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk(v)
+vals = list(walk(json.load(open("agents/offers.json"))))
+sys.exit(0 if any("example.com" in v or "Your Company" in v for v in vals) else 1)' 2>/dev/null; then
+    warn "agents/offers.json still says Your Company / example.com - edit before sending"
 else
     ok "agents/offers.json has your own URLs"
 fi

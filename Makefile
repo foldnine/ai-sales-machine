@@ -11,10 +11,10 @@ ENV_FILE := .env
 
 .PHONY: help init up down restart logs ps config validate test health \
 	    migrate migrate-status env-upgrade seed-demo db db-reset \
-	    pull-model models credentials workflows setup backup restore-drill restore-help shell-n8n secrets-scan clean
+	    pull-model models credentials workflows setup n8n-owner dashboard-role activate install backup restore-drill restore-help shell-n8n secrets-scan clean
 
 help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 	    | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 $(ENV_FILE):
@@ -95,8 +95,20 @@ credentials: $(ENV_FILE) ## Create the n8n credentials the workflows use, from .
 workflows: $(ENV_FILE) ## Validate and import every workflow into n8n (all inactive)
 	@./infra/scripts/n8n-setup.sh workflows
 
-setup: $(ENV_FILE) ## First run after make up && make migrate: models, credentials, workflows
+n8n-owner: $(ENV_FILE) ## Create the n8n owner account from N8N_OWNER_* in .env (fresh instance only)
+	@./infra/scripts/n8n-setup.sh owner
+
+dashboard-role: $(ENV_FILE) ## Give the aisales_dashboard DB role its password (DASHBOARD_DB_PASSWORD)
+	@./infra/scripts/n8n-setup.sh dashboard
+
+activate: $(ENV_FILE) ## Activate discovery..drafting workflows; never WF-06 (send) or WF-08 (inbox)
+	@./infra/scripts/n8n-setup.sh activate
+
+setup: $(ENV_FILE) ## After make up && make migrate: models, n8n owner, credentials, workflows, dashboard role
 	@./infra/scripts/n8n-setup.sh all
+
+install: ## Guided first install: ./install.sh (re-run safely at any time)
+	@./install.sh
 
 deploy: $(ENV_FILE) ## Deploy origin/main: backup, migrate, import workflows, restart, health
 	@./infra/scripts/deploy.sh

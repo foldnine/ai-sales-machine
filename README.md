@@ -138,41 +138,73 @@ person reads.
 ```bash
 git clone https://github.com/foldnine/ai-sales-machine.git
 cd ai-sales-machine
-
-make init           # creates .env and Caddyfile, generates every secret
+./install.sh
 ```
 
-Open `.env` and set at least:
+The installer checks the prerequisites, generates every secret, asks a few
+questions (timezone, your login email, your name, company and website for the
+signature, an optional Telegram bot), then:
 
-| Variable | What |
+- starts PostgreSQL, n8n and the dashboard, and applies the schema
+- pulls the local models (`--skip-models` to do that later)
+- creates the n8n owner account, the credentials and the workflows
+- optionally switches on discovery, research, scoring and drafting
+- runs the health check and prints where to log in
+
+**Nothing that sends email is switched on.** WF-06 (dispatch) and WF-08
+(inbox) stay inactive and `OUTREACH_PAUSED=true` until you change them
+yourself. Re-running `./install.sh` is safe: secrets are kept, the owner is
+created once, and active workflows stay active. `./install.sh --yes` runs
+without questions (pre-fill with `INSTALL_*` variables, see the top of the
+script).
+
+When it finishes:
+
+| | |
 |---|---|
-| `GENERIC_TIMEZONE`, `TZ` | Your timezone. Send windows and schedules use it. |
-| `BOT_USER_AGENT` | How your crawler identifies itself. Put **your** contact URL in it. |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | From [@BotFather](https://t.me/BotFather). This is where approvals happen. |
-| `SMTP_*`, `IMAP_*`, `EMAIL_FROM*` | Your sending mailbox. Can wait until you are ready to send. |
+| **Dashboard** | <http://localhost:3000>. Password printed by the installer (`DASHBOARD_PASSWORD` in `.env`) |
+| **n8n editor** | <http://localhost:5678>. Your email, password `N8N_OWNER_PASSWORD` in `.env` |
 
 Back up `N8N_ENCRYPTION_KEY` somewhere other than this machine **now**. Every
 credential n8n stores is encrypted with it.
 
-Then bring it up:
+### The dashboard
+
+A web console for the operator, served on loopback like everything else:
+
+- **Overview**: the funnel from discovered to replied, today's activity,
+  what needs you
+- **Approval queue**: each draft next to the evidence and score behind it.
+  Approve, edit or reject it from the browser. Same rules as Telegram:
+  suppression, limits and `OUTREACH_PAUSED` still apply
+- **Companies**: every company with its research facts, inferences, unknowns
+  and sources, its signals, contacts and score breakdown
+- **Replies**: classified inbound mail and open conversations
+- **Segments and campaigns**: what converts
+- **System**: agent runs, failures and health
+
+It connects to PostgreSQL as `aisales_dashboard`. That role can read, and it
+can call the approval functions, but it cannot write to a table directly. To
+reach it from your other devices, use `tailscale serve --bg 3000`.
+
+### Manual install
+
+The same steps as separate commands, if you prefer them or are scripting a
+deployment:
 
 ```bash
-make up             # PostgreSQL, n8n, Caddy (Ollama runs on the host)
-make migrate        # create the schema
-make models         # pull every model .env names (several GB)
-```
-
-Open n8n at <http://localhost:5678> and create the owner account. Do it right
-away: until then, anyone who can reach the editor owns it. Then:
-
-```bash
-make credentials    # create the n8n credentials from .env (Postgres, Ollama, Telegram, SMTP, IMAP)
-make workflows      # import every workflow, all inactive
+make init            # .env + Caddyfile, every secret generated (never overwrites)
+$EDITOR .env         # GENERIC_TIMEZONE/TZ, N8N_OWNER_EMAIL, BOT_USER_AGENT, TELEGRAM_*
+make up              # PostgreSQL, n8n, dashboard (Ollama runs on the host)
+make migrate         # create the schema
+make setup           # models, n8n owner, credentials, workflows, dashboard role
+make activate        # optional: discovery..drafting on, sending stays off
 make restart SERVICE=n8n
-make health         # should end with "healthy"
+make health          # should end with "healthy"
 ```
 
-`make setup` runs models, credentials and workflows in one go.
+Each `make setup` step also exists on its own: `make models`, `make n8n-owner`,
+`make credentials`, `make workflows`, `make dashboard-role`.
 
 ### Make it yours (before anything is sent)
 
@@ -194,11 +226,16 @@ The full guide is [`docs/customizing.md`](docs/customizing.md).
 
 ### Turn it on, in this order
 
-1. Activate **WF-00 Pipeline Test** and run it once. It exercises the
+1. Open **WF-00 Pipeline Test** in n8n and run it once. It exercises the
    database, the model and Telegram end to end.
 2. Activate **WF-99**, **WF-10/11** (Telegram) and **WF-101** (agent health).
-3. Activate **WF-01 → WF-05**. Drafts start arriving in Telegram. Read them
-   for a week. This is where you tune prompts and rubric.
+3. Activate **WF-01 → WF-05**. Drafts start arriving in the dashboard and
+   on Telegram. Read them for a week. This is where you tune prompts and the
+   rubric.
+
+   Steps 2 and 3 are what `make activate` does, or the installer when you
+   answer yes. The Telegram workflows are only switched on once a bot token
+   is set.
 4. Set up the mailbox ([`docs/mail.md`](docs/mail.md)), warm it up, then
    activate **WF-06** and **WF-08**.
 5. Only now set `OUTREACH_PAUSED=false`. Messages still go out one approval
@@ -261,7 +298,8 @@ switch sending on. It is not legal advice.
 ## Repository layout
 
 ```
-├── docker-compose.yml     PostgreSQL, n8n, Caddy - pinned, healthchecked, loopback-only
+├── install.sh             guided install; safe to re-run
+├── docker-compose.yml     PostgreSQL, n8n, dashboard, Caddy - pinned, healthchecked, loopback-only
 ├── .env.example           every setting, documented; safe defaults
 ├── Makefile               make help
 ├── agents/                per-agent contract (JSON Schema) + offers.json

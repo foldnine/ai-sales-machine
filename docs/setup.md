@@ -22,45 +22,94 @@ make --version
 ## First run
 
 ```bash
-git clone <your-repo-url> ai-sales-machine
+git clone https://github.com/foldnine/ai-sales-machine.git
 cd ai-sales-machine
-
-make init          # creates .env and Caddyfile, generates all secrets
+./install.sh
 ```
 
-`make init` generates `POSTGRES_PASSWORD`, `N8N_ENCRYPTION_KEY` and
-`BACKUP_PASSPHRASE`. It
-never overwrites an existing `.env`.
+`install.sh` is the recommended path. In order, it:
 
-Then edit `.env` and fill in what cannot be generated:
+1. **Checks prerequisites.** Docker running, Compose v2, `make`, `git`,
+   `openssl`, `python3`, `curl`, Ollama on the host. It refuses to touch an
+   `aisales-*` stack that another checkout started.
+2. **Runs `make init`.** This creates `.env` (chmod 600) and the Caddyfile,
+   and fills every secret that is still empty:
+   - `POSTGRES_PASSWORD`, `N8N_ENCRYPTION_KEY` and `BACKUP_PASSPHRASE`
+   - `N8N_OWNER_PASSWORD`
+   - `DASHBOARD_PASSWORD`, `DASHBOARD_SESSION_SECRET` and
+     `DASHBOARD_DB_PASSWORD`
 
-| Variable | Needed for |
-|---|---|
-| `LLM_API_KEY` | Everything. The research, scoring, outreach and conversation agents. |
-| `N8N_HOST`, `CADDY_DOMAIN`, `WEBHOOK_URL` | Only once a real domain exists. The placeholders are fine locally. |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Phase 3 |
-| `APOLLO_API_KEY` | Phase 4 |
-| `EMAIL_*`, `SMTP_*`, `IMAP_*` | Phase 7 and 8 |
+   A value that is already set is never changed.
+3. **Asks a few questions.** Timezone (auto-detected), your n8n login email,
+   your name, company and website, and optionally a Telegram bot token and
+   chat id. The answers go into `.env`. Your name, company and website
+   replace the placeholders in `prompts/signature.md` and
+   `agents/offers.json`, and only the placeholders.
+4. **Starts the stack and prepares it.** It runs `make up`, waits for the
+   healthchecks, then runs `make migrate` and `make models` (skip with
+   `--skip-models`).
+5. **Sets up n8n.** `make n8n-owner` creates the owner account through n8n's
+   setup API, so nobody else can claim the editor. `make credentials` and
+   `make workflows` follow.
+6. **Gives the dashboard its database login.** `make dashboard-role` sets the
+   password of the read-mostly `aisales_dashboard` role.
+7. **Optionally runs `make activate`.** This switches on everything except
+   WF-06 (send), WF-08 (inbox) and the manual pipeline test. The Telegram
+   workflows are switched on only when a bot token is set.
+8. **Restarts n8n, runs `make health` and prints where to log in.**
+
+It is idempotent: run it again after any failure, or after changing an
+answer. `--yes` skips the questions and takes `INSTALL_TIMEZONE`,
+`INSTALL_EMAIL`, `INSTALL_NAME`, `INSTALL_COMPANY`, `INSTALL_WEBSITE`,
+`INSTALL_TELEGRAM_TOKEN`, `INSTALL_TELEGRAM_CHAT_ID` and
+`INSTALL_ACTIVATE=yes|no` from the environment.
 
 **Back up `N8N_ENCRYPTION_KEY` now, somewhere outside this machine.** Every
 credential stored inside n8n is encrypted with it. Lose it and every credential
 has to be re-entered by hand.
 
-Then:
+### Manual install
+
+The same steps, one at a time:
 
 ```bash
-make up            # start the stack
-make migrate       # apply database migrations
-make pull-model    # pull the local Ollama model (several GB, takes a while)
-make health        # verify everything
+make init            # .env + Caddyfile, secrets generated, nothing overwritten
+$EDITOR .env         # see the table below
+make up              # PostgreSQL, n8n, dashboard
+make migrate         # apply database migrations
+make setup           # models, n8n owner, credentials, workflows, dashboard role
+make activate        # optional; never WF-06 or WF-08
+make restart SERVICE=n8n
+make health          # verify everything
 ```
 
+What `make init` cannot generate:
+
+| Variable | Needed for |
+|---|---|
+| `GENERIC_TIMEZONE`, `TZ` | Schedules and the send window. Defaults to UTC. |
+| `N8N_OWNER_EMAIL`, `N8N_OWNER_NAME` | The n8n owner account `make n8n-owner` creates. |
+| `BOT_USER_AGENT` | How the crawlers identify themselves. Put your own contact URL in it. |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Approvals and alerts on Telegram (optional; the dashboard approves too). |
+| `EMAIL_*`, `SMTP_*`, `IMAP_*` | Sending and reading replies, once the mailbox is set up (`docs/mail.md`). |
+| `N8N_HOST`, `CADDY_DOMAIN`, `WEBHOOK_URL` | Only once a real domain exists. The placeholders are fine locally. |
+
 `make health` should end with `healthy`. If it does not, it names what failed.
+
+### The dashboard
+
+<http://localhost:3000> (`DASHBOARD_BIND_ADDR`/`DASHBOARD_PORT`). One
+operator login, password `DASHBOARD_PASSWORD`. It reads PostgreSQL as
+`aisales_dashboard`, a role that can select and call the approval functions
+but has no direct write access to any table. Rotate its password by changing
+`DASHBOARD_DB_PASSWORD`, then run `make dashboard-role` and restart the
+dashboard. Remote access works the same way as for n8n:
+`tailscale serve --bg 3000`.
 
 ## Verify
 
 ```bash
-make ps                    # all five containers up
+make ps                    # every container up
 make migrate-status        # every migration applied, 0 pending
 make db                    # psql shell; \dt should list 8 tables
 ```
