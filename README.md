@@ -1,6 +1,15 @@
 <div align="center">
 
+<a href="https://foldnine.dev">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/foldnine-mark-dark.svg">
+    <img src=".github/assets/foldnine-mark-light.svg" alt="FoldNine" width="96">
+  </picture>
+</a>
+
 # AI Sales Machine
+
+<sub>by <a href="https://foldnine.dev">FoldNine</a></sub>
 
 **A self-hosted B2B prospecting pipeline that reads public signals, does the
 research a good salesperson would, and drafts outreach you would actually

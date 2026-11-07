@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 948.3 1000" role="img" aria-label="Foldnine">
+  <!-- The Foldnine mark, vectorised from logo/5.png. Three closed polygons:
+       the fan of five rays converging on a single point, the folded facet, and
+       the leaf that folds away from it. Fill is currentColor so the mark takes
+       the polarity of whatever surface it sits on. -->
+  <g fill="#FFFFFF" fill-rule="nonzero">
+    <path d="M0 166.7 202 257 424.5 364.5 577.2 442.5 695.4 510.7 577.2 559.9 0 819.4 0 701.1 490.1 559.9 632.2 516.4 566.5 516.4 0 536.1 0 422 640.4 497.5 577.2 472.1 394.9 406.4 0 278.3Z"/>
+    <path d="M769 0 801.3 27.9 948.3 174.1 948.3 437.6 380.1 1000 380.1 823.5 677.3 527.9 695.4 510.7 695.4 615.8 769 615.8Z"/>
+    <path d="M450.7 0 748.8 0 748.8 174.1 276.7 174.1Z"/>
+  </g>
+</svg>
