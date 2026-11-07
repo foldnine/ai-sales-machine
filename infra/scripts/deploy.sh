@@ -120,7 +120,7 @@ while [ "$(q "select count(*) from n8n.execution_entity where status in ('runnin
 done
 # Nothing started since the drain can have claimed work, so this loop only
 # ever waits for runs that end within seconds.
-docker compose up -d --remove-orphans
+docker compose up -d --build --remove-orphans
 docker compose restart n8n
 until [ "$(docker inspect -f '{{.State.Health.Status}}' aisales-n8n)" = healthy ]; do sleep 3; done
 now_active=$(q "select count(*) from n8n.workflow_entity where active")

@@ -65,3 +65,11 @@ Thumbs.db
 
 # Claude Code permissions granted on this machine
 .claude/settings.local.json
+
+# dashboard
+dashboard/.env.local
+dashboard/.next/
+dashboard/node_modules/
+dashboard/next-env.d.ts
+dashboard/tsconfig.tsbuildinfo
+!dashboard/.env.local.example

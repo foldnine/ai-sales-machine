@@ -54,9 +54,13 @@ section "Containers"
 if ! command -v docker >/dev/null 2>&1; then
     fail "docker CLI not found"
 else
-    for c in aisales-postgres aisales-n8n aisales-caddy; do
+    for c in aisales-postgres aisales-n8n aisales-dashboard; do
         check_container "$c"
     done
+    # Caddy is an optional profile (docker-compose.yml): checked only if it exists.
+    if docker inspect aisales-caddy >/dev/null 2>&1; then
+        check_container aisales-caddy
+    fi
 fi
 
 section "PostgreSQL"
@@ -79,6 +83,15 @@ if docker exec aisales-n8n wget -q -O- http://127.0.0.1:5678/healthz >/dev/null 
     ok "healthz responding"
 else
     fail "healthz not responding"
+fi
+
+section "Dashboard"
+if ! docker ps --format '{{.Names}}' | grep -qx aisales-dashboard; then
+    warn "aisales-dashboard is not running (make up)"
+elif docker exec aisales-dashboard wget -q -O- http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
+    ok "dashboard answers and reaches the database"
+else
+    fail "dashboard cannot reach the database - run make dashboard-role, then make restart SERVICE=dashboard"
 fi
 
 section "Ollama"
@@ -141,13 +154,28 @@ section "Sender identity"
 # The repository ships with placeholder identity. A message signed "Your Name"
 # with a link to example.com is worse than no message: edit these first
 # (docs/customizing.md). Reported, never a failure.
-if grep -q 'Your Name' prompts/signature.md 2>/dev/null; then
+# Whole lines only: the note at the top of the file names the placeholder too.
+if grep -qx 'Your Name' prompts/signature.md 2>/dev/null; then
     warn "prompts/signature.md still says 'Your Name' - edit before sending"
 else
     ok "prompts/signature.md has a sender name"
 fi
-if grep -q 'example\.com' agents/offers.json 2>/dev/null; then
-    warn "agents/offers.json still points at example.com - edit before sending"
+# The taglines and URLs, not the $comment that explains them.
+if python3 -c '
+import json, sys
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k in ("tagline", "tagline_sr", "url") and isinstance(v, str):
+                yield v
+            else:
+                yield from walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk(v)
+vals = list(walk(json.load(open("agents/offers.json"))))
+sys.exit(0 if any("example.com" in v or "Your Company" in v for v in vals) else 1)' 2>/dev/null; then
+    warn "agents/offers.json still says Your Company / example.com - edit before sending"
 else
     ok "agents/offers.json has your own URLs"
 fi

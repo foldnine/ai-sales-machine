@@ -56,7 +56,18 @@ if ! grep -q '^BOT_USER_AGENT=' "$ENV_FILE"; then
     add_ua=1
     changes=1
 fi
-if [[ $add_caddy -eq 0 && $add_ua -eq 0 ]]; then
+# Added with the dashboard and the automatic n8n owner. Secrets are generated
+# on --apply, never shown; the rest get the .env.example default.
+NEW_VARS="N8N_OWNER_EMAIL N8N_OWNER_NAME N8N_OWNER_PASSWORD DASHBOARD_PASSWORD DASHBOARD_SESSION_SECRET DASHBOARD_DB_PASSWORD DASHBOARD_BIND_ADDR DASHBOARD_PORT DASHBOARD_STYLE"
+missing_new=""
+for v in $NEW_VARS; do
+    if ! grep -q "^${v}=" "$ENV_FILE"; then
+        echo "    add     $v"
+        missing_new="$missing_new $v"
+        changes=1
+    fi
+done
+if [[ $add_caddy -eq 0 && $add_ua -eq 0 && -z "$missing_new" ]]; then
     echo "    none"
 fi
 
@@ -104,6 +115,25 @@ fi
 
 if [[ $add_ua -eq 1 ]]; then
     printf '\n# How the crawlers identify themselves. Put your own site or contact URL here.\nBOT_USER_AGENT="AiSalesMachineBot/1.0 (+https://example.com/bot)"\n' >> "$tmp"
+fi
+
+gen_hex() { openssl rand -hex "$1" 2>/dev/null || LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c $(( $1 * 2 )); }
+if [[ -n "$missing_new" ]]; then
+    printf '\n# Added by env-upgrade (n8n owner, dashboard). See .env.example.\n' >> "$tmp"
+    for v in $missing_new; do
+        case "$v" in
+            N8N_OWNER_PASSWORD)       val="Ai$(gen_hex 10)7" ;;
+            DASHBOARD_PASSWORD)       val="$(gen_hex 12)" ;;
+            DASHBOARD_SESSION_SECRET) val="$(gen_hex 32)" ;;
+            DASHBOARD_DB_PASSWORD)    val="$(gen_hex 24)" ;;
+            N8N_OWNER_NAME)           val='"AI Sales Operator"' ;;
+            DASHBOARD_BIND_ADDR)      val="127.0.0.1" ;;
+            DASHBOARD_PORT)           val="3000" ;;
+            DASHBOARD_STYLE)          val="default" ;;
+            *)                        val="" ;;
+        esac
+        printf '%s=%s\n' "$v" "$val" >> "$tmp"
+    done
 fi
 
 cat "$tmp" > "$ENV_FILE"   # keeps the file's own permissions

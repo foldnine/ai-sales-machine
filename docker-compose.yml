@@ -256,6 +256,10 @@ services:
     <<: *common
     image: ${CADDY_IMAGE:-caddy:2.8-alpine}
     container_name: aisales-caddy
+    # Optional. Only for a public domain in front of n8n (inbound webhooks).
+    # Remote access is `tailscale serve`, which needs no Caddy, so a default
+    # `make up` leaves it out:  docker compose --profile caddy up -d
+    profiles: ["caddy"]
     depends_on:
       - n8n
     environment:
@@ -281,6 +285,44 @@ services:
       start_period: 15s
     networks:
       - edge
+
+  dashboard:
+    <<: *common
+    build: ./dashboard
+    image: ${DASHBOARD_IMAGE:-aisales-dashboard:local}
+    container_name: aisales-dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # aisales_dashboard (0033_dashboard.sql): reads the public schema and can
+      # call three logged approval functions. It cannot write a table and
+      # cannot see the n8n schema, where the credentials are.
+      DATABASE_URL: postgres://aisales_dashboard:${DASHBOARD_DB_PASSWORD:?run make init or make env-upgrade APPLY=yes}@postgres:5432/${POSTGRES_DB:-aisales}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?run make init or make env-upgrade APPLY=yes}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?run make init or make env-upgrade APPLY=yes}
+      # Shown read-only on the System page; the dashboard never changes them.
+      OUTREACH_PAUSED: ${OUTREACH_PAUSED:-true}
+      OUTREACH_AUTOSEND_ENABLED: ${OUTREACH_AUTOSEND_ENABLED:-false}
+      OUTREACH_DAILY_LIMIT: ${OUTREACH_DAILY_LIMIT:-5}
+      OUTREACH_MIN_SCORE: ${OUTREACH_MIN_SCORE:-60}
+      OUTREACH_WORKING_HOUR_START: ${OUTREACH_WORKING_HOUR_START:-9}
+      OUTREACH_WORKING_HOUR_END: ${OUTREACH_WORKING_HOUR_END:-17}
+      OUTREACH_WORKING_DAYS: ${OUTREACH_WORKING_DAYS:-1,2,3,4,5}
+      DASHBOARD_STYLE: ${DASHBOARD_STYLE:-default}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      TZ: ${TZ:-UTC}
+    ports:
+      # Loopback only, like everything else. From another device use
+      # `tailscale serve --bg --https=8443 3000` (docs/setup.md).
+      - "${DASHBOARD_BIND_ADDR:-127.0.0.1}:${DASHBOARD_PORT:-3000}:3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
 
 networks:
   backend:
