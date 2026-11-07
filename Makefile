@@ -23,8 +23,8 @@ $(ENV_FILE):
 init: ## Create .env and Caddyfile from templates, generate secrets
 	@./infra/scripts/bootstrap.sh
 
-up: $(ENV_FILE) ## Start the whole stack
-	$(COMPOSE) up -d
+up: $(ENV_FILE) ## Start the whole stack (builds the dashboard image when it changed)
+	$(COMPOSE) up -d --build
 	@echo
 	@echo "Stack starting. Check with: make ps / make health"
 
@@ -45,7 +45,7 @@ config: $(ENV_FILE) ## Render and validate the resolved compose configuration
 
 validate: ## Validate compose syntax and shell scripts without starting anything
 	@echo "==> docker compose config"
-	@tmp=$$(mktemp); 	 sed -e 's/^POSTGRES_PASSWORD=$$/POSTGRES_PASSWORD=validate/' 	     -e 's/^N8N_ENCRYPTION_KEY=$$/N8N_ENCRYPTION_KEY=validate/' 	     .env.example > $$tmp; 	 $(COMPOSE) --env-file $$tmp config -q && echo "    compose OK"; 	 rc=$$?; rm -f $$tmp; exit $$rc
+	@tmp=$$(mktemp); 	 sed -e 's/^POSTGRES_PASSWORD=$$/POSTGRES_PASSWORD=validate/' 	     -e 's/^N8N_ENCRYPTION_KEY=$$/N8N_ENCRYPTION_KEY=validate/' -e 's/^DASHBOARD_PASSWORD=$$/DASHBOARD_PASSWORD=validate/' -e 's/^DASHBOARD_SESSION_SECRET=$$/DASHBOARD_SESSION_SECRET=validate/' -e 's/^DASHBOARD_DB_PASSWORD=$$/DASHBOARD_DB_PASSWORD=validate/'	     .env.example > $$tmp; 	 $(COMPOSE) --env-file $$tmp config -q && echo "    compose OK"; 	 rc=$$?; rm -f $$tmp; exit $$rc
 	@echo "==> shell scripts"
 	@for f in scripts/*.sh infra/scripts/*.sh; do bash -n "$$f" && echo "    $$f OK"; done
 	@echo "==> n8n workflows"
@@ -68,12 +68,13 @@ env-upgrade: $(ENV_FILE) ## Show how .env differs from the current stack; APPLY=
 migrate-status: $(ENV_FILE) ## Show applied and pending migrations
 	@./infra/scripts/migrate.sh --status
 
-seed-demo: $(ENV_FILE) ## Load demo rows (example domains only, never in production)
-	@echo "Loading postgres/seeds/0002_demo_data.sql"
-	@docker exec -i aisales-postgres psql -v ON_ERROR_STOP=1 -q \
-	    -U "$$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2)" \
-	    -d "$$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2)" \
-	    < postgres/seeds/0002_demo_data.sql
+seed-demo: $(ENV_FILE) ## Load an invented demo pipeline (.example domains) - a throwaway install only, never production
+	@for f in postgres/seeds/0002_demo_data.sql postgres/seeds/0003_demo_pipeline.sql; do \
+	    echo "Loading $$f"; \
+	    docker exec -i aisales-postgres psql -v ON_ERROR_STOP=1 -q \
+	        -U "$$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2)" \
+	        -d "$$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2)" < "$$f" || exit 1; \
+	done
 	@echo "done"
 
 db: $(ENV_FILE) ## Open a psql shell on the application database

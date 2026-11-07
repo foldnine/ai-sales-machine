@@ -54,7 +54,7 @@ section "Containers"
 if ! command -v docker >/dev/null 2>&1; then
     fail "docker CLI not found"
 else
-    for c in aisales-postgres aisales-n8n aisales-caddy; do
+    for c in aisales-postgres aisales-n8n aisales-dashboard aisales-caddy; do
         check_container "$c"
     done
 fi
@@ -79,6 +79,15 @@ if docker exec aisales-n8n wget -q -O- http://127.0.0.1:5678/healthz >/dev/null 
     ok "healthz responding"
 else
     fail "healthz not responding"
+fi
+
+section "Dashboard"
+if ! docker ps --format '{{.Names}}' | grep -qx aisales-dashboard; then
+    warn "aisales-dashboard is not running (make up)"
+elif docker exec aisales-dashboard wget -q -O- http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
+    ok "dashboard answers and reaches the database"
+else
+    fail "dashboard cannot reach the database - run make dashboard-role, then make restart SERVICE=dashboard"
 fi
 
 section "Ollama"

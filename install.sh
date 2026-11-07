@@ -295,12 +295,12 @@ fi
 # --- 3. the stack -----------------------------------------------------------
 
 step "Starting the stack"
+note "The first run builds the dashboard image - a couple of minutes."
 run "make up" make up
 wait_healthy aisales-postgres 120 && ok "PostgreSQL"
 wait_healthy aisales-n8n 240 && ok "n8n"
-if compose_has dashboard; then
-    wait_healthy aisales-dashboard 180 && ok "dashboard" || true
-fi
+# The dashboard is checked after the Dashboard step below: its database role
+# only exists once the migrations have run.
 
 step "Database"
 run "make migrate" make migrate
