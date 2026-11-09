@@ -7,11 +7,18 @@ SHELL := /bin/bash
 COMPOSE := docker compose
 ENV_FILE := .env
 
+# The dashboard image built from exactly this checkout's ./dashboard: the
+# image workflow tags each build sha-<first 7 of the commit>, and on main that
+# commit is the last one touching these paths. Without git it is left empty and
+# docker-compose.yml falls back to building ./dashboard.
+DASHBOARD_TAG ?= $(shell git log -1 --format=sha-%H -- dashboard .github/workflows/dashboard-image.yml 2>/dev/null | cut -c1-11)
+export DASHBOARD_TAG
+
 .DEFAULT_GOAL := help
 
 .PHONY: help init up down restart logs ps config validate test health \
 	    migrate migrate-status env-upgrade seed-demo db db-reset \
-	    pull-model models credentials workflows setup n8n-owner dashboard-role activate install backup restore-drill restore-help shell-n8n secrets-scan clean
+	    pull-model models credentials workflows setup n8n-owner dashboard-role dashboard-build activate install backup restore-drill restore-help shell-n8n secrets-scan clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -23,10 +30,14 @@ $(ENV_FILE):
 init: ## Create .env and Caddyfile from templates, generate secrets
 	@./infra/scripts/bootstrap.sh
 
-up: $(ENV_FILE) ## Start the whole stack (builds the dashboard image when it changed)
-	$(COMPOSE) up -d --build
+up: $(ENV_FILE) ## Start the whole stack (pulls the current dashboard image)
+	-@$(COMPOSE) pull --quiet dashboard
+	$(COMPOSE) up -d
 	@echo
 	@echo "Stack starting. Check with: make ps / make health"
+
+dashboard-build: $(ENV_FILE) ## Build the dashboard from ./dashboard and run it (after changing it; set DASHBOARD_IMAGE=aisales-dashboard:local in .env to keep it)
+	$(COMPOSE) up -d --build dashboard
 
 down: ## Stop the stack, keep all data
 	$(COMPOSE) down

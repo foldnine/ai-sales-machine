@@ -288,8 +288,13 @@ services:
 
   dashboard:
     <<: *common
+    # A ready image from GHCR (.github/workflows/dashboard-image.yml), pinned
+    # to the commit of this checkout's ./dashboard: DASHBOARD_TAG is set by the
+    # Makefile and deploy.sh. `build` is the fallback when it cannot be pulled
+    # (no tag, offline, a build still running), and what `make dashboard-build`
+    # uses after you change the dashboard yourself.
     build: ./dashboard
-    image: ${DASHBOARD_IMAGE:-aisales-dashboard:local}
+    image: ${DASHBOARD_IMAGE:-ghcr.io/foldnine/ai-sales-machine-dashboard:${DASHBOARD_TAG:-local}}
     container_name: aisales-dashboard
     depends_on:
       postgres:
