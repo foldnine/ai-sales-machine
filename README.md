@@ -141,6 +141,11 @@ company takes roughly 7 GPU minutes (research about 4.6, scoring about 2.3).
 That is about 150 companies a day, which is plenty for an approval queue a
 person reads.
 
+You do not need the big models. The production install behind this repo runs
+on a 12 GB RTX 4070 with 8-9B models (`qwen3.5:9b`, `llama3.1:8b`); set the
+model names in `.env`. Expect shorter research and slower runs; the
+database-side checks do not depend on the model's size.
+
 > **macOS:** run Ollama natively, not in Docker. Docker on macOS has no Metal
 > access, so a containerised model runs on the CPU. The stack already expects
 > this. See [`docs/ollama.md`](docs/ollama.md).
@@ -329,11 +334,10 @@ switch sending on. It is not legal advice.
 ## Repository layout
 
 ```
-├── install.sh             guided install; safe to re-run
 ├── docker-compose.yml     PostgreSQL, n8n, dashboard (+ optional Caddy) - pinned, healthchecked, loopback-only
 ├── .env.example           every setting, documented; safe defaults
 ├── Makefile               make help
-├── install.sh             one-command install
+├── install.sh             one-command install; safe to re-run
 ├── dashboard/             the web dashboard (Next.js, one read-only container)
 ├── agents/                per-agent contract (JSON Schema) + offers.json
 ├── prompts/               the prompts, read at run time

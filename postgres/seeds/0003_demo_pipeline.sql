@@ -211,9 +211,22 @@ BEGIN
                 CASE line WHEN 'infrastructure' THEN (ARRAY['Platform role','Quick question about on-call','The Kubernetes move','Cloud costs'])[1 + i % 4]
                           ELSE (ARRAY['Orders by email','A question about invoices','Order handling'])[1 + i % 3] END,
                 'Hi ' || fname || E',\n\n' || hook || E'\n\n'
+                -- The problem sentence names what this company published, not
+                -- what "companies your size" usually feel (docs/outreach-generation.md).
+                || CASE sig_type
+                     WHEN 'hiring_devops' THEN 'The ad says the role will own CI/CD and on-call, which today sit with the product engineers.'
+                     WHEN 'kubernetes_adoption' THEN 'The post ends with the cluster costs and alert noise still on the to-do list.'
+                     WHEN 'cloud_migration' THEN 'The careers page lists the migration as the platform team''s main project, and that team is two people.'
+                     WHEN 'reliability_problem' THEN 'Three of the incidents mention the same database failover.'
+                     WHEN 'cloud_cost_problem' THEN 'It is listed as the first goal for the new hire, ahead of the platform work.'
+                     WHEN 'manual_process' THEN 'The order page asks customers to download the sheet, fill it in and email it back.'
+                     WHEN 'hiring_manual_ops' THEN 'The ad says the role re-enters webshop orders into the accounting system each day.'
+                     WHEN 'tool_sprawl' THEN 'Checkout, invoicing, tracking and returns each live on a different site.'
+                     ELSE 'Your news page says the catalogue doubled at the same time, and orders still arrive by email.' END
+                || ' '
                 || CASE line WHEN 'infrastructure'
-                     THEN 'Teams your size usually feel it as product engineers losing a day a week to infrastructure. I run a fixed-price infrastructure audit: two weeks, a written report, and a prioritised plan your team can run with.'
-                     ELSE 'Businesses your size usually lose several hours a week to re-typing the same data. I do a short process audit that shows which steps can run by themselves, with a sample report you can read first.' END
+                     THEN 'I run a fixed-price infrastructure audit: two weeks, a written report, and a prioritised plan your team can run with.'
+                     ELSE 'I do a short process audit that shows which of those steps can run by themselves, with a sample report you can read first.' END
                 || E'\n\nWould it be useful to compare notes for 20 minutes next week?\n\n--\nYour Name\nYour Company\nhttps://example.com/\n\n'
                 || 'Not the right person, or not interested? Reply "stop" and you will not hear from us again.',
                 st,
