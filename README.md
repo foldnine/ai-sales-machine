@@ -153,6 +153,14 @@ database-side checks do not depend on the model's size.
 ## Quick start
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/foldnine/ai-sales-machine/main/get.sh | bash
+```
+
+That clones the repository into `~/ai-sales-machine` and runs `./install.sh`.
+[`get.sh`](get.sh) is short; read it first if you prefer. Or do the same by
+hand:
+
+```bash
 git clone https://github.com/foldnine/ai-sales-machine.git
 cd ai-sales-machine
 ./install.sh
@@ -337,7 +345,8 @@ switch sending on. It is not legal advice.
 ├── docker-compose.yml     PostgreSQL, n8n, dashboard (+ optional Caddy) - pinned, healthchecked, loopback-only
 ├── .env.example           every setting, documented; safe defaults
 ├── Makefile               make help
-├── install.sh             one-command install; safe to re-run
+├── get.sh                 one-line install: clone, then run install.sh
+├── install.sh             guided install; safe to re-run
 ├── dashboard/             the web dashboard (Next.js, one read-only container)
 ├── agents/                per-agent contract (JSON Schema) + offers.json
 ├── prompts/               the prompts, read at run time
