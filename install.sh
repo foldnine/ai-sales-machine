@@ -295,7 +295,7 @@ fi
 # --- 3. the stack -----------------------------------------------------------
 
 step "Starting the stack"
-note "The first run builds the dashboard image - a couple of minutes."
+note "The first run downloads the images - a few minutes on a slow connection."
 run "make up" make up
 wait_healthy aisales-postgres 120 && ok "PostgreSQL"
 wait_healthy aisales-n8n 240 && ok "n8n"

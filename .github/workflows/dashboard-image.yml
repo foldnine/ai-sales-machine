@@ -1,0 +1,74 @@
+# Publishes the dashboard image to GitHub Container Registry, so an install
+# pulls a ready image instead of running a Next.js build on the user's machine.
+#
+#   ghcr.io/foldnine/ai-sales-machine-dashboard:sha-abc1234  every build; what an install pulls (Makefile, DASHBOARD_TAG)
+#   ghcr.io/foldnine/ai-sales-machine-dashboard:main         the newest build of main
+#   ghcr.io/foldnine/ai-sales-machine-dashboard:1.2.3          release tags (v1.2.3)
+#
+# amd64 and arm64 (Apple silicon, ARM servers). Pull requests build it without
+# pushing, so a broken Dockerfile fails before merge.
+name: dashboard-image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "dashboard/**"
+      - ".github/workflows/dashboard-image.yml"
+  pull_request:
+    paths:
+      - "dashboard/**"
+      - ".github/workflows/dashboard-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: dashboard-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/foldnine/ai-sales-machine-dashboard
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+          labels: |
+            org.opencontainers.image.title=AI Sales Machine dashboard
+            org.opencontainers.image.licenses=MIT
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: ./dashboard
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

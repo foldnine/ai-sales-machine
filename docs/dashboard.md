@@ -103,6 +103,14 @@ npm run dev                        # http://localhost:3000
 npx tsc --noEmit                   # what CI runs, plus `npm run build`
 ```
 
+An install does not build the dashboard: `make up` pulls the image CI
+published for this checkout's `dashboard/` folder
+(`ghcr.io/foldnine/ai-sales-machine-dashboard:sha-...`, see
+`.github/workflows/dashboard-image.yml`), and builds it locally only when that
+image cannot be pulled. To run your own changes in the stack, set
+`DASHBOARD_IMAGE=aisales-dashboard:local` in `.env` and run
+`make dashboard-build`.
+
 A development database: `make up && make migrate && make seed-demo` on a
 throwaway install, then `make dashboard-role` and use
 `postgres://aisales_dashboard:<DASHBOARD_DB_PASSWORD>@127.0.0.1:5432/aisales`.

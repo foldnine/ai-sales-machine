@@ -120,7 +120,13 @@ while [ "$(q "select count(*) from n8n.execution_entity where status in ('runnin
 done
 # Nothing started since the drain can have claimed work, so this loop only
 # ever waits for runs that end within seconds.
-docker compose up -d --build --remove-orphans
+# The dashboard comes from GHCR, pinned to this checkout (see DASHBOARD_TAG in
+# the Makefile); a failed pull (offline, a local image name)
+# leaves the image already here, or the build fallback in docker-compose.yml.
+DASHBOARD_TAG=$(git log -1 --format=sha-%H -- dashboard .github/workflows/dashboard-image.yml | cut -c1-11)
+export DASHBOARD_TAG
+docker compose pull --quiet dashboard || echo "    dashboard image not pulled; using the local one"
+docker compose up -d --remove-orphans
 docker compose restart n8n
 until [ "$(docker inspect -f '{{.State.Health.Status}}' aisales-n8n)" = healthy ]; do sleep 3; done
 now_active=$(q "select count(*) from n8n.workflow_entity where active")
